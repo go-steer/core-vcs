@@ -39,9 +39,10 @@ pushing to production.
 
 The design of record is core-agent's
 [`docs/gitops-vcs-design.md`](https://github.com/go-steer/core-agent/blob/main/docs/gitops-vcs-design.md).
-It adopts the vocabulary, verb set, error codes and publish guards of
-kube-agents' `version-control-support.md`, so a skill written against one
-runs against the other. [`docs/README.md`](./docs/README.md) says what is
+It borrows the `proposal` vocabulary, the publish guards and the error
+taxonomy of kube-agents' `version-control-support.md`; it does not adopt
+that design's broker protocol, which follows from a sandbox topology this
+library's consumers do not have. [`docs/README.md`](./docs/README.md) says what is
 local to this repository.
 
 ## Developing

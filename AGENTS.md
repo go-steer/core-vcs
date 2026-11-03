@@ -22,9 +22,10 @@ consumer; kube-agents' Go side, k8s-lookout, cogo and scion are the next.
 
 **Source of truth.** The design of record is core-agent's
 [`docs/gitops-vcs-design.md`](https://github.com/go-steer/core-agent/blob/main/docs/gitops-vcs-design.md),
-which in turn adopts kube-agents'
-`docs/designs/version-control-support.md` for vocabulary, verbs, error
-codes and guards. Read both before changing anything exported.
+which borrows kube-agents' `docs/designs/version-control-support.md` for
+its `proposal` vocabulary, publish guards and error taxonomy — and
+deliberately **not** its wire protocol. Read the core-agent doc before
+changing anything exported.
 [`docs/README.md`](./docs/README.md) says what is local to this repo.
 
 ## The rules that make this library what it is
@@ -54,6 +55,10 @@ codes and guards. Read both before changing anything exported.
 - **Errors carry a code from the shared set** (`BASE_MOVED`,
   `PROTECTED_BRANCH`, `FORGE_CALL_FAILED`, …) and the forge's own message
   in `Detail`. A caller sees the code, never a bare HTTP status.
+- **The API is designed for Go consumers.** Typed structs, `context`,
+  Go errors. It is not shaped to kube-agents' `/v1/vcs/*` JSON or anyone
+  else's protocol; a broker, if one is ever needed, is one more
+  `Provider`.
 
 ## Layout
 
