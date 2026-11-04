@@ -49,14 +49,18 @@ const (
 	PublicAlias = "www.fake.forge.example"
 	// ValidToken is the token the fixture server accepts.
 	ValidToken = "fake-secret-token-do-not-log"
+	// CloneUser is the HTTP basic-auth username CloneAuth returns.
+	CloneUser = "x-fake-token"
 )
 
 // Options shapes a Provider instance for a test case.
 type Options struct {
-	Noun    string
-	Verbs   []vcs.Verb
-	Labels  bool
-	DialURL string // overrides the scheme://host[:port] the client dials
+	Noun      string
+	Verbs     []vcs.Verb
+	Labels    bool
+	DialURL   string          // overrides the scheme://host[:port] the client dials
+	CloneURL  string          // overrides CloneURL when non-empty
+	Protected map[string]bool // overrides ProtectedBranch when non-nil
 }
 
 // Provider is the client half.
@@ -124,6 +128,9 @@ func (p *Provider) Capabilities(vcs.Repo) vcs.Capabilities {
 
 // CloneURL implements vcs.Provider.
 func (p *Provider) CloneURL(repo vcs.Repo) string {
+	if p.opts.CloneURL != "" {
+		return p.opts.CloneURL
+	}
 	return p.baseURL(repo.Forge) + "/" + repo.Ref.Path + ".git"
 }
 
@@ -141,6 +148,9 @@ func (p *Provider) CloneAuth(ctx context.Context, repo vcs.Repo) (*vcs.BasicAuth
 
 // BaseBranch implements vcs.Provider.
 func (p *Provider) BaseBranch(ctx context.Context, repo vcs.Repo) (string, error) {
+	if p.opts.DialURL == "" && p.opts.CloneURL != "" {
+		return "main", nil
+	}
 	var out struct {
 		DefaultBranch string `json:"default_branch"`
 	}
@@ -155,6 +165,12 @@ func (p *Provider) BaseBranch(ctx context.Context, repo vcs.Repo) (string, error
 
 // ProtectedBranch implements vcs.Provider.
 func (p *Provider) ProtectedBranch(ctx context.Context, repo vcs.Repo, branch string) (bool, error) {
+	if p.opts.Protected != nil {
+		return p.opts.Protected[branch], nil
+	}
+	if p.opts.DialURL == "" && p.opts.CloneURL != "" {
+		return branch == "main", nil
+	}
 	var out struct {
 		Protected bool `json:"protected"`
 	}
