@@ -17,11 +17,14 @@
 // provider does not enter this table until it passes the contract test.
 package providers
 
-import "github.com/go-steer/core-vcs/vcs"
+import (
+	"github.com/go-steer/core-vcs/providers/git"
+	"github.com/go-steer/core-vcs/vcs"
+)
 
 // NewRegistry returns a Registry populated with every shipped provider.
 func NewRegistry() *vcs.Registry {
 	r := vcs.NewRegistry()
-	// Providers register here, one line each, as they land.
+	r.MustRegister(git.Name, git.New)
 	return r
 }
