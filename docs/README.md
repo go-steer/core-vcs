@@ -17,4 +17,7 @@ below, and core-agent's doc gains a pointer.
 
 ## Local designs
 
-(none yet)
+- [`api-design.md`](./api-design.md) — the exported surface of package
+  `vcs` (core-vcs#2): `RepoRef`, `Forge`, `Repo`, `Credential`,
+  `Provider`, `Error`/codes, `Registry`/`Catalog`, and where the
+  `Workspace` guard state lives.
