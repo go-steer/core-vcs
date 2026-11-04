@@ -19,6 +19,7 @@ package providers
 
 import (
 	"github.com/go-steer/core-vcs/providers/git"
+	"github.com/go-steer/core-vcs/providers/github"
 	"github.com/go-steer/core-vcs/vcs"
 )
 
@@ -26,5 +27,6 @@ import (
 func NewRegistry() *vcs.Registry {
 	r := vcs.NewRegistry()
 	r.MustRegister(git.Name, git.New)
+	r.MustRegister(github.Name, github.New)
 	return r
 }
