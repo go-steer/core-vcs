@@ -24,6 +24,8 @@ beyond a Go toolchain.
 
 ```
 dev/
+├── api-surface.txt        # promised / unsupported package classification
+├── api-breaks.txt         # acknowledged API breaks since last tag
 ├── tools/                 # entry points users run locally
 │   ├── ci                 # aggregator — runs every check below
 │   ├── vet                # go vet ./...
@@ -33,6 +35,7 @@ dev/
 │   ├── verify-go-format   # gofmt -s + goimports check (read-only)
 │   ├── fix-go-format      # gofmt -s -w + goimports -w (auto-fix)
 │   ├── verify-mod-tidy    # `go mod tidy` clean check
+│   ├── verify-apidiff     # apidiff of promised packages vs latest tag
 │   ├── verify-vuln        # govulncheck ./...
 │   ├── add-license-headers # bulk-applier for SPDX + copyright headers
 │   ├── common.sh          # shared bash helpers (ensure_tool, run_step)
@@ -45,6 +48,7 @@ dev/
         ├── lint-go        # → dev/tools/lint-go
         ├── verify-go-format
         ├── verify-mod-tidy
+        ├── verify-apidiff
         └── verify-vuln
 ```
 

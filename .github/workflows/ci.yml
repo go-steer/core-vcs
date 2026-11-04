@@ -45,6 +45,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
@@ -59,6 +61,8 @@ jobs:
         run: dev/ci/presubmits/vet
       - name: Build
         run: dev/ci/presubmits/build
+      - name: API diff
+        run: dev/ci/presubmits/verify-apidiff
       - name: Test
         # Forge-gated tests skip cleanly in CI without tokens; the
         # contract test runs against httptest fixtures.
