@@ -728,6 +728,7 @@ func classifyPushError(repo Repo, err error) error {
 	}
 	if strings.Contains(msg, "non-fast-forward") ||
 		strings.Contains(msg, "failed to update ref") ||
+		strings.Contains(msg, "command error on") ||
 		strings.Contains(msg, "hook declined") ||
 		strings.Contains(msg, "protected") ||
 		strings.Contains(msg, "rejected") {

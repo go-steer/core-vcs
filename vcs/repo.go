@@ -141,6 +141,14 @@ func (r Repo) CreateProposal(ctx context.Context, req ProposalRequest) (Proposal
 	if req.Source == "" {
 		return Proposal{}, Errorf(CodeForgeRejected, r.Forge.Name, "source branch is empty; publish a branch first").WithVerb(VerbProposalCreate)
 	}
+	if err := checkBranchName(r.Forge.Name, req.Source); err != nil {
+		return Proposal{}, r.wrap(VerbProposalCreate, err)
+	}
+	if req.Target != "" {
+		if err := checkBranchName(r.Forge.Name, req.Target); err != nil {
+			return Proposal{}, r.wrap(VerbProposalCreate, err)
+		}
+	}
 	if req.Title == "" && caps.ProposalNoun != ProposalNounLink {
 		return Proposal{}, Errorf(CodeForgeRejected, r.Forge.Name, "proposal title is empty").WithVerb(VerbProposalCreate)
 	}

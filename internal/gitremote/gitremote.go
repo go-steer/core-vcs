@@ -40,6 +40,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/format/pktline"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/plumbing/protocol/packp"
+	"github.com/go-git/go-git/v5/plumbing/protocol/packp/capability"
 	"github.com/go-git/go-git/v5/plumbing/storer"
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	"github.com/go-git/go-git/v5/plumbing/transport/server"
@@ -155,6 +156,19 @@ func (r *Remote) DeleteBranch(tb testing.TB, branch string) {
 	defer r.mu.Unlock()
 	if err := r.store.RemoveReference(plumbing.NewBranchReferenceName(branch)); err != nil {
 		tb.Fatalf("RemoveReference(%s): %v", branch, err)
+	}
+}
+
+// SetHEAD points the bare remote's HEAD symbolic reference at branch.
+// Passing an unborn branch name makes HEAD dangle so BaseBranch reports
+// BASE_BRANCH_MISSING.
+func (r *Remote) SetHEAD(tb testing.TB, branch string) {
+	tb.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	target := plumbing.NewBranchReferenceName(branch)
+	if err := r.store.SetReference(plumbing.NewSymbolicReference(plumbing.HEAD, target)); err != nil {
+		tb.Fatalf("SetHEAD(%s): %v", branch, err)
 	}
 }
 
@@ -323,6 +337,11 @@ func (r *Remote) serve(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		if headRef, err := r.store.Reference(plumbing.HEAD); err == nil && headRef.Type() == plumbing.SymbolicReference {
+			if ar.Capabilities != nil && len(ar.Capabilities.Get(capability.SymRef)) == 0 {
+				_ = ar.Capabilities.Add(capability.SymRef, "HEAD:"+headRef.Target().String())
+			}
+		}
 		ar.Prefix = [][]byte{[]byte("# service=" + svc), pktline.Flush}
 		w.Header().Set("Content-Type", "application/x-"+svc+"-advertisement")
 		_ = ar.Encode(w)
@@ -349,12 +368,6 @@ func (r *Remote) serve(w http.ResponseWriter, req *http.Request) {
 		_ = resp.Encode(w)
 
 	case sub == "/"+transport.ReceivePackServiceName && req.Method == http.MethodPost:
-		if r.rejectPush != "" {
-			reason := r.rejectPush
-			r.rejectPush = ""
-			http.Error(w, reason, http.StatusForbidden)
-			return
-		}
 		sess, err := srv.NewReceivePackSession(ep, nil)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -369,6 +382,21 @@ func (r *Remote) serve(w http.ResponseWriter, req *http.Request) {
 		upReq := packp.NewReferenceUpdateRequest()
 		if err := upReq.Decode(bytes.NewReader(bodyBytes)); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if r.rejectPush != "" {
+			reason := r.rejectPush
+			r.rejectPush = ""
+			status := packp.NewReportStatus()
+			status.UnpackStatus = "ok"
+			for _, cmd := range upReq.Commands {
+				status.CommandStatuses = append(status.CommandStatuses, &packp.CommandStatus{
+					ReferenceName: cmd.Name,
+					Status:        reason,
+				})
+			}
+			w.Header().Set("Content-Type", "application/x-git-receive-pack-result")
+			_ = status.Encode(w)
 			return
 		}
 		status, _ := sess.ReceivePack(req.Context(), upReq)
