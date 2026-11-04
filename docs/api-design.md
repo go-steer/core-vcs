@@ -462,9 +462,54 @@ type Error struct {
 
 func (e *Error) Error() string // "CODE: detail" (+ " [forge/verb]" when set)
 func (e *Error) Unwrap() error
+func (e *Error) WithVerb(v Verb) *Error
 func Errorf(code Code, forge string, format string, args ...any) *Error // %w wraps
 func CodeOf(err error) Code       // "" when err is not a *Error
 func IsCode(err error, c Code) bool
+
+// ---- Workspace: go-git working copy (#3) --------------------------------
+
+const (
+	DefaultMaxCloneBytes int64 = 256 << 20
+	DefaultBranchPrefix        = "agent/"
+)
+
+type Policy struct {
+	MaxCloneBytes int64
+	BranchPrefix  string
+}
+
+type FileStatus struct{ Path, Staging, Worktree string }
+
+type Status struct {
+	Branch   string
+	Revision string
+	Clean    bool
+	Files    []FileStatus
+}
+
+type DiffOptions struct {
+	AgainstBase bool
+	Paths       []string
+}
+
+type PublishResult struct{ Branch, Revision string }
+
+type Workspace struct{ /* unexported */ }
+
+func Clone(ctx context.Context, repo Repo, branch, dir string, policy Policy) (*Workspace, error)
+func (w *Workspace) Repo() Repo
+func (w *Workspace) Dir() string
+func (w *Workspace) ClonedBranch() string
+func (w *Workspace) ClonedRevision() string
+func (w *Workspace) CurrentBranch() (string, error)
+func (w *Workspace) HEAD() (string, error)
+func (w *Workspace) Status() (Status, error)
+func (w *Workspace) Diff(opts DiffOptions) (string, error)
+func (w *Workspace) Log(limit int) ([]Commit, error)
+func (w *Workspace) Branch(name string) error
+func (w *Workspace) Commit(msg string, identity Identity) (Commit, error)
+func (w *Workspace) Publish(ctx context.Context, branch string) (PublishResult, error)
 ```
 
 ### Where each AGENTS.md rule is enforced

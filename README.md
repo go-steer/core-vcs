@@ -29,7 +29,9 @@ Two things are true of every verb:
 
 ## Status
 
-Pre-release (`v0.x`). The API churns until the second provider ships.
+Frozen at `v1.0.0`. Compatible changes land under `v1.x`; `dev/tools/verify-apidiff`
+guards the exported API surface of every `promised` package in
+[`dev/api-surface.txt`](./dev/api-surface.txt) against the latest release tag.
 The first consumer is
 [`go-steer/core-agent`](https://github.com/go-steer/core-agent)'s `vcs_*`
 tool suite, which lets its distroless image open a proposal instead of
