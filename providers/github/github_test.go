@@ -16,13 +16,16 @@ package github_test
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-steer/core-vcs/internal/vcstest"
 	"github.com/go-steer/core-vcs/providers/github"
@@ -355,6 +358,12 @@ func TestLiveGitHub(t *testing.T) {
 		t.Skip("skipping live GitHub test: set CORE_VCS_GITHUB_TOKEN and CORE_VCS_GITHUB_REPO to run")
 	}
 
+	writeRoundtrip := strings.TrimSpace(os.Getenv("CORE_VCS_GITHUB_WRITE")) == "1"
+	role := vcs.RoleContext
+	if writeRoundtrip {
+		role = vcs.RoleGitOps
+	}
+
 	ctx := context.Background()
 	reg := vcs.NewRegistry()
 	reg.MustRegister(github.Name, github.New)
@@ -362,11 +371,15 @@ func TestLiveGitHub(t *testing.T) {
 		Name:     "live-github",
 		Provider: github.Name,
 		Cred:     vcs.StaticToken(token),
+		CommitIdentity: vcs.Identity{
+			Name:  "core-vcs live test",
+			Email: "live-test@go-steer.dev",
+		},
 	}
 	cat, err := vcs.NewCatalog(reg, []vcs.Forge{forge}, []vcs.RepoConfig{{
 		Forge:      "live-github",
 		Repository: repoSpec,
-		Role:       vcs.RoleContext,
+		Role:       role,
 	}})
 	if err != nil {
 		t.Fatalf("NewCatalog: %v", err)
@@ -384,5 +397,88 @@ func TestLiveGitHub(t *testing.T) {
 	}
 	if _, err := repo.ListProposals(ctx, vcs.ProposalFilter{Page: vcs.Page{Limit: 5}}); err != nil {
 		t.Fatalf("ListProposals: %v", err)
+	}
+
+	cloneDir := filepath.Join(t.TempDir(), "worktree")
+	ws, err := vcs.Clone(ctx, repo, caps.BaseBranch, cloneDir, vcs.Policy{})
+	if err != nil {
+		t.Fatalf("Clone(%q): %v", caps.BaseBranch, err)
+	}
+	commits, err := ws.Log(3)
+	if err != nil || len(commits) == 0 {
+		t.Fatalf("Log(3) = (%v, %v), want >= 1 commit", commits, err)
+	}
+
+	if !writeRoundtrip {
+		return
+	}
+
+	// Verify the in-process TARGET_IS_BRANCH guard refuses pushing to the base branch.
+	if _, err := ws.Publish(ctx, ws.ClonedBranch()); !vcs.IsCode(err, vcs.CodeTargetIsBranch) {
+		t.Fatalf("Publish(base %q) = %v, want %s", ws.ClonedBranch(), err, vcs.CodeTargetIsBranch)
+	}
+
+	branchName := fmt.Sprintf("agent/live-roundtrip-%d", time.Now().UnixNano())
+	if err := ws.Branch(branchName); err != nil {
+		t.Fatalf("Branch(%q): %v", branchName, err)
+	}
+	smokeFile := filepath.Join(cloneDir, "SMOKE_TEST.md")
+	if err := os.WriteFile(smokeFile, []byte("# Live Round-Trip Test\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	st, err := ws.Status()
+	if err != nil || st.Clean {
+		t.Fatalf("Status = (%+v, %v), want dirty worktree", st, err)
+	}
+	committed, err := ws.Commit("test(live): verify pure-Go proposal round-trip", vcs.Identity{})
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	diffOut, err := ws.Diff(vcs.DiffOptions{AgainstBase: true})
+	if err != nil || !strings.Contains(diffOut, "SMOKE_TEST.md") {
+		t.Fatalf("Diff(AgainstBase) = (%q, %v), want SMOKE_TEST.md diff", diffOut, err)
+	}
+
+	pub, err := ws.Publish(ctx, branchName)
+	if err != nil {
+		t.Fatalf("Publish(%q): %v", branchName, err)
+	}
+	if pub.Revision != committed.Revision {
+		t.Errorf("Publish.Revision = %q, want %q", pub.Revision, committed.Revision)
+	}
+
+	prop, err := repo.CreateProposal(ctx, vcs.ProposalRequest{
+		Title:  "test(live): pure-Go core-vcs round-trip (auto-closing)",
+		Body:   "Automated live round-trip test from `TestLiveGitHub` (`CORE_VCS_GITHUB_WRITE=1`).",
+		Source: branchName,
+		Target: caps.BaseBranch,
+		Draft:  true,
+	})
+	if err != nil {
+		t.Fatalf("CreateProposal: %v", err)
+	}
+	defer func() {
+		if closed, err := repo.CloseProposal(ctx, prop.Number); err != nil {
+			t.Errorf("CloseProposal(#%d): %v", prop.Number, err)
+		} else if closed.State != vcs.ProposalClosed {
+			t.Errorf("CloseProposal(#%d).State = %q, want %q", prop.Number, closed.State, vcs.ProposalClosed)
+		}
+	}()
+
+	cm, err := repo.CommentProposal(ctx, prop.Number, "Automated comment from `TestLiveGitHub`.")
+	if err != nil || cm.ID == "" {
+		t.Fatalf("CommentProposal(#%d) = (%+v, %v)", prop.Number, cm, err)
+	}
+	viewed, err := repo.GetProposal(ctx, prop.Number)
+	if err != nil || viewed.Revision != committed.Revision {
+		t.Fatalf("GetProposal(#%d) = (%+v, %v), want Revision=%q", prop.Number, viewed, err, committed.Revision)
+	}
+	pCommits, err := repo.ProposalCommits(ctx, prop.Number, vcs.Page{Limit: 10})
+	if err != nil || len(pCommits.Commits) != 1 {
+		t.Fatalf("ProposalCommits(#%d) = (%+v, %v), want 1 commit", prop.Number, pCommits, err)
+	}
+	pComments, err := repo.ProposalComments(ctx, prop.Number, vcs.Page{Limit: 10})
+	if err != nil || len(pComments.Comments) == 0 {
+		t.Fatalf("ProposalComments(#%d) = (%+v, %v), want >= 1 comment", prop.Number, pComments, err)
 	}
 }
