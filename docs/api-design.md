@@ -76,14 +76,20 @@ guard state lives because that question shapes `Repo` and `Provider`.
    unlisted repository and it is spelled out.
 
 7. **`Credential` is an interface; its sources are constructors.**
-   `Token(ctx) (string, error)` is the W0 seam. `StaticToken(s)` and
-   `TokenFile(path)` return unexported types whose `String`, `GoString`
-   and `Format` print `[redacted]`, so a token cannot reach a log through
-   `%v` of a `Forge`. `TokenFile` reads on every call, trimmed, because
-   mounted secrets rotate. There is no `TokenEnv`: reading an env var is
-   the consumer's (`config.token_env` → `StaticToken`), per AGENTS.md "a
-   provider never reads an env var or a file itself". `Cred == nil` is
-   anonymous and legal only where the provider says so (`git`, read-only).
+   `Token(ctx) (string, error)` is the credential-provider seam.
+   `CredentialFunc(fn)` adapts any `func(ctx context.Context) (string, error)`
+   (such as `core-agent`'s outbound `CredentialProvider` / Auth Manager /
+   credential proxy, resolving either the per-caller identity from `ctx` or
+   a configured known subject ID) with `[redacted]` formatting and
+   `FORGE_UNAUTHORIZED` wrapping. `StaticToken(s)` and `TokenFile(path)`
+   are local/test helpers returning unexported types whose `String`,
+   `GoString` and `Format` print `[redacted]`, so a token cannot reach a
+   log through `%v` of a `Forge`. `TokenFile` reads on every call, trimmed,
+   because mounted secrets rotate. There is no `TokenEnv`: reading an env
+   var is the consumer's (`config.token_env` → `StaticToken`), per
+   AGENTS.md "a provider never reads an env var or a file itself".
+   `Cred == nil` is anonymous and legal only where the provider says so
+   (`git`, read-only).
 
 8. **`CAFile` is read by the core, once, into a `*tls.Config`.**
    `vcs.NewHTTPClient(Forge)` and `vcs.TLSConfig(Forge)` build the

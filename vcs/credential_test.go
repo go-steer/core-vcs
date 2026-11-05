@@ -16,6 +16,7 @@ package vcs_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -90,5 +91,55 @@ func TestTokenFileReReadsOnRotation(t *testing.T) {
 		if rendered := fmt.Sprintf(verb, cred); strings.Contains(rendered, "second-token") {
 			t.Errorf("fmt.Sprintf(%q, TokenFile) leaked the token: %s", verb, rendered)
 		}
+	}
+}
+
+func TestCredentialFuncContextAndWrapping(t *testing.T) {
+	t.Parallel()
+	type callerKey struct{}
+	ctx := context.WithValue(context.Background(), callerKey{}, "alice@acme.example")
+
+	var gotCaller string
+	cred := vcs.CredentialFunc(func(ctx context.Context) (string, error) {
+		gotCaller, _ = ctx.Value(callerKey{}).(string)
+		return "  minted-token-for-" + gotCaller + " \n", nil
+	})
+
+	tok, err := cred.Token(ctx)
+	if err != nil {
+		t.Fatalf("CredentialFunc.Token: %v", err)
+	}
+	if gotCaller != "alice@acme.example" || tok != "minted-token-for-alice@acme.example" {
+		t.Errorf("got (%q, caller=%q), want minted-token-for-alice@acme.example", tok, gotCaller)
+	}
+
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s"} {
+		if rendered := fmt.Sprintf(verb, cred); rendered != "[redacted]" {
+			t.Errorf("fmt.Sprintf(%q, CredentialFunc) = %q, want [redacted]", verb, rendered)
+		}
+	}
+
+	// Nil CredentialFunc returns CodeForgeUnauthorized.
+	var nilFn vcs.CredentialFunc
+	if _, err := nilFn.Token(ctx); !vcs.IsCode(err, vcs.CodeForgeUnauthorized) {
+		t.Errorf("nil CredentialFunc error = %v, want CodeForgeUnauthorized", err)
+	}
+
+	// Empty resolved token returns CodeForgeUnauthorized.
+	emptyFn := vcs.CredentialFunc(func(context.Context) (string, error) { return "   ", nil })
+	if _, err := emptyFn.Token(ctx); !vcs.IsCode(err, vcs.CodeForgeUnauthorized) {
+		t.Errorf("empty CredentialFunc error = %v, want CodeForgeUnauthorized", err)
+	}
+
+	// Plain error is wrapped in CodeForgeUnauthorized; existing *vcs.Error is preserved.
+	plainErrFn := vcs.CredentialFunc(func(context.Context) (string, error) { return "", errors.New("vault unreachable") })
+	if _, err := plainErrFn.Token(ctx); !vcs.IsCode(err, vcs.CodeForgeUnauthorized) {
+		t.Errorf("plainErrFn error = %v, want CodeForgeUnauthorized", err)
+	}
+	vcsErrFn := vcs.CredentialFunc(func(context.Context) (string, error) {
+		return "", vcs.Errorf(vcs.CodeForgeUnavailable, "gh", "auth proxy 503")
+	})
+	if _, err := vcsErrFn.Token(ctx); !vcs.IsCode(err, vcs.CodeForgeUnavailable) {
+		t.Errorf("vcsErrFn error = %v, want preserved CodeForgeUnavailable", err)
 	}
 }
