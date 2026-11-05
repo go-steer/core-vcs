@@ -16,6 +16,7 @@ package vcs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -31,6 +32,36 @@ type Credential interface {
 
 // redacted is what every credential prints as, under every verb.
 const redacted = "[redacted]"
+
+// CredentialFunc adapts a function to the Credential interface, allowing an
+// external credential provider or proxy (resolving per-caller identity from
+// ctx or minting a token for a configured subject) to plug into Forge.Cred
+// without a wrapper type. It prints as "[redacted]" under every fmt verb.
+type CredentialFunc func(ctx context.Context) (string, error)
+
+// Token calls f(ctx) and validates that the returned token is non-empty.
+func (f CredentialFunc) Token(ctx context.Context) (string, error) {
+	if f == nil {
+		return "", Errorf(CodeForgeUnauthorized, "", "credential function is nil")
+	}
+	tok, err := f(ctx)
+	if err != nil {
+		var vcsErr *Error
+		if errors.As(err, &vcsErr) {
+			return "", err
+		}
+		return "", Errorf(CodeForgeUnauthorized, "", "resolving credential: %w", err)
+	}
+	tok = strings.TrimSpace(tok)
+	if tok == "" {
+		return "", Errorf(CodeForgeUnauthorized, "", "resolved credential is empty")
+	}
+	return tok, nil
+}
+
+func (CredentialFunc) String() string             { return redacted }
+func (CredentialFunc) GoString() string           { return redacted }
+func (CredentialFunc) Format(s fmt.State, _ rune) { _, _ = s.Write([]byte(redacted)) }
 
 // StaticToken is a credential holding one fixed token. It prints as
 // "[redacted]" under %v, %+v, %#v and %s, so a Forge can be logged.
