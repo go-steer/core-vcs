@@ -171,21 +171,23 @@ def main() -> None:
                     counts["sh"] += 1
                     print(f"sh:   {path.relative_to(REPO_ROOT)}")
 
-    # YAML: workflows, golangci-lint config, hugo config.
+    # YAML: workflows and golangci-lint config.
     yaml_files = [
         *list((REPO_ROOT / ".github/workflows").glob("*.yml")),
         REPO_ROOT / "dev/tools/.golangci.yml",
-        REPO_ROOT / "",
     ]
     for path in yaml_files:
-        if not path.exists():
+        if not path.is_file():
             continue
         if apply_header(path, HASH_HEADER, "# ", has_shebang=False):
             counts["yaml"] += 1
             print(f"yaml: {path.relative_to(REPO_ROOT)}")
 
-    # Python: scripts under dev/tools/ that have a shebang.
-    py_files = [REPO_ROOT / "dev/tools/add-license-headers"]
+    # Python: scripts under dev/tools/ and scripts/ that have a shebang.
+    py_files = [
+        REPO_ROOT / "dev/tools/add-license-headers",
+        REPO_ROOT / "scripts/verify-internal-links.py",
+    ]
     for path in py_files:
         if not path.exists():
             continue

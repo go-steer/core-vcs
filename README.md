@@ -26,6 +26,16 @@ Two things are true of every verb:
 - **Only the remote half is abstracted.** Status, diff, log and commit are
   go-git on the local copy. Only what crosses the network or spends a
   credential goes through a provider.
+- **Shared object cache across sessions and processes.** Setting
+  `Policy.CacheDir` maintains a shared bare packfile cache per repository
+  under an advisory `flock`, giving each session an isolated `.git/`
+  worktree with `.git/objects/info/alternates` and read-through overlay
+  storage.
+
+- **Docs:** <https://go-steer.github.io/core-vcs/>
+- **API design:** [`docs/api-design.md`](./docs/api-design.md)
+- **Contributing:** [`CONTRIBUTING.md`](./CONTRIBUTING.md). Agents, read
+  [`AGENTS.md`](./AGENTS.md).
 
 ## Status
 

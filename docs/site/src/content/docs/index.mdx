@@ -1,0 +1,60 @@
+---
+title: core-vcs
+description: Forge-neutral version-control library in pure Go for agents that run where there is no git binary.
+template: doc
+tableOfContents: false
+hero:
+  title: core-vcs
+  tagline: Forge-neutral Git and proposal workflows in pure Go — built for distroless agents that never write the target branch.
+  actions:
+    - text: Getting started
+      link: /core-vcs/getting-started/
+      icon: right-arrow
+      variant: primary
+    - text: Why core-vcs
+      link: /core-vcs/why-core-vcs/
+      icon: right-arrow
+      variant: secondary
+    - text: GitHub
+      link: https://github.com/go-steer/core-vcs
+      icon: github
+      variant: minimal
+---
+
+import { CardGrid, LinkCard, Card } from '@astrojs/starlight/components';
+
+`core-vcs` gives a Go agent a pure-Go [go-git](https://github.com/go-git/go-git) working copy and a set of neutral verbs — `clone`, `commit`, `publish`, `proposal-create`, `proposal-view`, `proposal-comment`, `proposal-update`, `proposal-close` — that a provider package translates to one forge's API:
+
+| Provider | Package | Covers |
+|---|---|---|
+| `github` | `github.com/go-steer/core-vcs/providers/github` | `github.com` and GitHub Enterprise Server (`/api/v3`) |
+| `gitlab` | `github.com/go-steer/core-vcs/providers/gitlab` | `gitlab.com` and self-managed GitLab (`/api/v4`, private CA supported) |
+| `git` | `github.com/go-steer/core-vcs/providers/git` | Any bare Git remote over HTTPS (`publish` + optional compare link via `ProposalURLTemplate`) |
+
+## Core guarantees
+
+<CardGrid>
+  <Card title="Neutral vocabulary" icon="approve-check">
+    A change offered for review is a **proposal**. Pull request and merge request appear only inside a provider's `ProposalNoun` string — never in exported types, verbs, or error codes.
+  </Card>
+  <Card title="The agent never writes the target branch" icon="warning">
+    `Workspace.Publish` refuses `TARGET_IS_BRANCH` and `BRANCH_NOT_OURS` in memory before any network call. There is no force-push verb and no option that relaxes the guards.
+  </Card>
+  <Card title="Pure Go, distroless-ready" icon="seti:go">
+    Local verbs (`Status`, `Diff`, `Log`, `Branch`, `Commit`) run over `go-git` with zero shell-outs to a `git` binary. Forge verbs use thin `net/http` clients with no vendor SDKs.
+  </Card>
+  <Card title="Shared object cache across sessions" icon="rocket">
+    Set `Policy.CacheDir` so concurrent sessions and multiple agent processes share a single bare packfile store per repository via `flock` and read-through overlay storage.
+  </Card>
+</CardGrid>
+
+## Where to go next
+
+<CardGrid>
+  <LinkCard title="Why core-vcs" href="/core-vcs/why-core-vcs/" description="Why we split version control out of core-agent into a standalone pure-Go library." />
+  <LinkCard title="Getting started" href="/core-vcs/getting-started/" description="Configure a Catalog, clone a repository, commit, publish, and open a proposal." />
+  <LinkCard title="Workspace & publish guards" href="/core-vcs/concepts/workspace-and-guards/" description="How TARGET_IS_BRANCH, BRANCH_NOT_OURS, BASE_MOVED, and BRANCH_MOVED protect target branches." />
+  <LinkCard title="Shared object cache" href="/core-vcs/concepts/shared-cache/" description="Use Policy.CacheDir for linked worktrees across concurrent sessions and processes." />
+  <LinkCard title="Credentials & TLS" href="/core-vcs/concepts/credentials/" description="Plug in an outbound credential proxy with CredentialFunc or local tokens." />
+  <LinkCard title="Error codes" href="/core-vcs/reference/error-codes/" description="All 20 structured vcs.Code values, retryability, and recovery guidance." />
+</CardGrid>
