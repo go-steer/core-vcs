@@ -17,10 +17,8 @@ name: CI
 on:
   push:
     branches: [main]
-    paths-ignore: ['**/*.md']
   pull_request:
     branches: [main]
-    paths-ignore: ['**/*.md']
 
 # Cancel in-progress runs when a new commit lands on the same branch
 # so we don't queue stale tests.
