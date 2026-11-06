@@ -483,6 +483,7 @@ const (
 type Policy struct {
 	MaxCloneBytes int64
 	BranchPrefix  string
+	CacheDir      string // optional shared bare object cache across sessions and processes
 }
 
 type FileStatus struct{ Path, Staging, Worktree string }
@@ -613,9 +614,20 @@ type branchRecord struct {
   keeps a `map[dir]*Workspace` for the daemon's lifetime. The core may ship
   a small `vcs.Workspaces` set for that if #3 finds every consumer writing
   the same ten lines.
-- `BranchPrefix` and `MaxCloneBytes` arrive as a `vcs.Policy` the
-  `Workspace` is created with; they are not on `Forge` or `Repo` because
+- `BranchPrefix`, `MaxCloneBytes` and `CacheDir` arrive as a `vcs.Policy`
+  the `Workspace` is created with; they are not on `Forge` or `Repo` because
   they are per-install, not per-forge.
+- When `Policy.CacheDir` is non-empty, `Clone` maintains a shared bare
+  object cache at `<CacheDir>/<host>/<path>.git` (synchronised across
+  goroutines and OS processes with an advisory `flock` on
+  `<CacheDir>/<host>/<path>.git.lock` only during the incremental `Fetch` of
+  the base branch) and materialises the session's working tree with its own
+  private `.git/` directory (`HEAD`, `index`, `refs/`, `config`, and
+  `objects/` for commits created by the session), `.git/objects/info/alternates`
+  pointing at the shared bare `objects/` directory, and a layered
+  `storage.Storer` that reads historical objects from the shared bare cache
+  while writing all session state exclusively to the session's private
+  `.git/`.
 
 ## Resolved questions
 

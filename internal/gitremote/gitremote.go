@@ -228,7 +228,11 @@ func (r *Remote) CommitOnBranch(tb testing.TB, branch, msg string, files map[str
 				if err != nil {
 					return err
 				}
-				return writeMemFile(wtFS, f.Name, []byte(data))
+				if err := writeMemFile(wtFS, f.Name, []byte(data)); err != nil {
+					return err
+				}
+				_, err = wt.Add(f.Name)
+				return err
 			})
 		}
 	}
