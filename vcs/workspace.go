@@ -55,6 +55,11 @@ type Policy struct {
 	// BranchPrefix is the required prefix on every branch Branch creates
 	// and Publish pushes. "" means DefaultBranchPrefix.
 	BranchPrefix string
+	// CacheDir, when non-empty, is a shared directory (safe across
+	// goroutines and OS processes on the same filesystem) where Clone
+	// maintains bare object caches per repository and links each Workspace's
+	// object store to them via git alternates.
+	CacheDir string
 }
 
 func (p Policy) normalize(forge string) (Policy, error) {
@@ -70,6 +75,7 @@ func (p Policy) normalize(forge string) (Policy, error) {
 	if err := checkBranchName(forge, p.BranchPrefix+"probe"); err != nil {
 		return Policy{}, Errorf(CodeConfigInvalid, forge, "invalid BranchPrefix %q: %w", p.BranchPrefix, err)
 	}
+	p.CacheDir = strings.TrimSpace(p.CacheDir)
 	return p, nil
 }
 
@@ -159,22 +165,29 @@ func Clone(ctx context.Context, repo Repo, branch, dir string, policy Policy) (*
 		return nil, err
 	}
 
-	gitRepo, err := git.PlainCloneContext(ctx, dir, false, &git.CloneOptions{
-		URL:           repo.CloneURL(),
-		Auth:          gitAuth,
-		ReferenceName: plumbing.NewBranchReferenceName(branch),
-		SingleBranch:  true,
-		Tags:          git.NoTags,
-		CABundle:      caBundle,
-	})
-	if err != nil {
-		_ = os.RemoveAll(dir)
-		return nil, classifyCloneError(repo, branch, err)
+	var gitRepo *git.Repository
+	if pol.CacheDir != "" {
+		gitRepo, err = cloneViaCache(ctx, repo, branch, dir, pol, gitAuth, caBundle)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		gitRepo, err = git.PlainCloneContext(ctx, dir, false, &git.CloneOptions{
+			URL:           repo.CloneURL(),
+			Auth:          gitAuth,
+			ReferenceName: plumbing.NewBranchReferenceName(branch),
+			SingleBranch:  true,
+			Tags:          git.NoTags,
+			CABundle:      caBundle,
+		})
+		if err != nil {
+			_ = os.RemoveAll(dir)
+			return nil, classifyCloneError(repo, branch, err)
+		}
+		// Remove the on-disk remote so .git/config carries no remote URL;
+		// Publish always dials repo.CloneURL() from memory.
+		_ = gitRepo.DeleteRemote(git.DefaultRemoteName)
 	}
-
-	// Remove the on-disk remote so .git/config carries no remote URL;
-	// Publish always dials repo.CloneURL() from memory.
-	_ = gitRepo.DeleteRemote(git.DefaultRemoteName)
 
 	treeBytes, err := measureWorktree(dir)
 	if err != nil {

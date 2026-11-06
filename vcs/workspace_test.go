@@ -16,9 +16,11 @@ package vcs_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/go-git/go-git/v5"
@@ -534,5 +536,191 @@ func TestGitConfigPoisoningIsIgnored(t *testing.T) {
 	}
 	if rem.BranchHash("agent/safe-push") != cm.Revision || pub.Revision != cm.Revision {
 		t.Fatalf("remote hash = %s, want %s", rem.BranchHash("agent/safe-push"), cm.Revision)
+	}
+}
+
+func TestSharedCacheWorktreesConcurrentAndIncremental(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	rem := gitremote.NewTLS(t, "acme/infra", map[string]string{
+		"deploy/replicas.yaml": "replicas: 2\n",
+		"README.md":            "# infra\n",
+	})
+	rem.RequireAuth(fakeprovider.CloneUser, fakeprovider.ValidToken)
+	repo := repoForRemote(t, rem, vcs.RoleGitOps, "main", map[string]bool{"main": true})
+
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "shared-cache")
+	pol := vcs.Policy{CacheDir: cacheDir}
+
+	// Spawn 6 concurrent sessions cloning against the same shared CacheDir,
+	// each creating its own branch, editing files, diffing, committing and
+	// publishing in parallel.
+	const sessions = 6
+	var wg sync.WaitGroup
+	errs := make(chan error, sessions)
+
+	for i := range sessions {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			workDir := filepath.Join(root, fmt.Sprintf("session-%d", id))
+			ws, err := vcs.Clone(ctx, repo, "", workDir, pol)
+			if err != nil {
+				errs <- fmt.Errorf("session %d Clone: %w", id, err)
+				return
+			}
+			// Verify .git/objects/info/alternates was written and points to the shared bare cache.
+			altBytes, err := os.ReadFile(filepath.Join(workDir, ".git", "objects", "info", "alternates"))
+			if err != nil || !strings.Contains(string(altBytes), cacheDir) {
+				errs <- fmt.Errorf("session %d alternates = (%q, %v), want path under %s", id, string(altBytes), err, cacheDir)
+				return
+			}
+			// Verify the worktree's own .git/objects/pack directory is empty
+			// (historical packfiles live only in the shared bare cache).
+			localPacks, _ := os.ReadDir(filepath.Join(workDir, ".git", "objects", "pack"))
+			if len(localPacks) != 0 {
+				errs <- fmt.Errorf("session %d local .git/objects/pack has %d files, want 0", id, len(localPacks))
+				return
+			}
+
+			branch := fmt.Sprintf("agent/session-%d", id)
+			if err := ws.Branch(branch); err != nil {
+				errs <- fmt.Errorf("session %d Branch: %w", id, err)
+				return
+			}
+			targetFile := filepath.Join(workDir, "deploy/replicas.yaml")
+			newContent := fmt.Sprintf("replicas: %d\n", 10+id)
+			if err := os.WriteFile(targetFile, []byte(newContent), 0o644); err != nil {
+				errs <- fmt.Errorf("session %d WriteFile: %w", id, err)
+				return
+			}
+			cm, err := ws.Commit(fmt.Sprintf("feat: scale replicas for session %d", id), vcs.Identity{})
+			if err != nil {
+				errs <- fmt.Errorf("session %d Commit: %w", id, err)
+				return
+			}
+			diffOut, err := ws.Diff(vcs.DiffOptions{AgainstBase: true})
+			if err != nil || !strings.Contains(diffOut, fmt.Sprintf("+replicas: %d", 10+id)) {
+				errs <- fmt.Errorf("session %d Diff = (%q, %v)", id, diffOut, err)
+				return
+			}
+			logs, err := ws.Log(5)
+			if err != nil || len(logs) < 2 {
+				errs <- fmt.Errorf("session %d Log = (%v, %v), want >= 2 commits", id, logs, err)
+				return
+			}
+			pub, err := ws.Publish(ctx, branch)
+			if err != nil {
+				errs <- fmt.Errorf("session %d Publish: %w", id, err)
+				return
+			}
+			if pub.Revision != cm.Revision || rem.BranchHash(branch) != cm.Revision {
+				errs <- fmt.Errorf("session %d published %s, remote has %s, want %s", id, pub.Revision, rem.BranchHash(branch), cm.Revision)
+				return
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+
+	// Advance main on the remote and verify a subsequent Clone using the same
+	// CacheDir incrementally fetches the new commit and checks it out.
+	newMainHash := rem.CommitOnBranch(t, "main", "chore: bump replicas on main", map[string]string{
+		"deploy/replicas.yaml": "replicas: 99\n",
+	}, false)
+
+	laterDir := filepath.Join(root, "session-later")
+	wsLater, err := vcs.Clone(ctx, repo, "main", laterDir, pol)
+	if err != nil {
+		t.Fatalf("later Clone: %v", err)
+	}
+	if wsLater.ClonedRevision() != newMainHash {
+		t.Errorf("later ClonedRevision = %s, want %s", wsLater.ClonedRevision(), newMainHash)
+	}
+	gotBytes, err := os.ReadFile(filepath.Join(laterDir, "deploy/replicas.yaml"))
+	if err != nil || string(gotBytes) != "replicas: 99\n" {
+		t.Errorf("later worktree deploy/replicas.yaml = (%q, %v), want replicas: 99", string(gotBytes), err)
+	}
+}
+
+func TestSharedCacheGuardsAndBaseMoved(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	rem := gitremote.NewTLS(t, "acme/infra", map[string]string{
+		"deploy/replicas.yaml": "replicas: 2\n",
+		"README.md":            "# infra\n",
+	})
+	rem.RequireAuth(fakeprovider.CloneUser, fakeprovider.ValidToken)
+	repo := repoForRemote(t, rem, vcs.RoleGitOps, "main", map[string]bool{"main": true})
+
+	root := t.TempDir()
+	pol := vcs.Policy{CacheDir: filepath.Join(root, "cache")}
+
+	// 1. Non-empty destination directory fails before touching worktree.
+	nonEmpty := filepath.Join(root, "non-empty")
+	if err := os.MkdirAll(nonEmpty, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nonEmpty, "existing.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := vcs.Clone(ctx, repo, "", nonEmpty, pol); vcs.CodeOf(err) != vcs.CodeGitFailed {
+		t.Errorf("Clone into non-empty dir CodeOf = %q (%v), want %q", vcs.CodeOf(err), err, vcs.CodeGitFailed)
+	}
+
+	// 2. MaxCloneBytes ceiling rejects oversize cached worktree and cleans up dir.
+	tooSmallPol := vcs.Policy{CacheDir: pol.CacheDir, MaxCloneBytes: 5}
+	oversizeDir := filepath.Join(root, "oversize")
+	if _, err := vcs.Clone(ctx, repo, "", oversizeDir, tooSmallPol); vcs.CodeOf(err) != vcs.CodeCloneTooLarge {
+		t.Errorf("Clone exceeding MaxCloneBytes CodeOf = %q (%v), want %q", vcs.CodeOf(err), err, vcs.CodeCloneTooLarge)
+	}
+	if _, err := os.Stat(oversizeDir); !os.IsNotExist(err) {
+		t.Errorf("oversizeDir still exists after CLONE_TOO_LARGE: err=%v", err)
+	}
+
+	// 3. Publish succeeds when remote main advances (fast-forward) after Clone.
+	wt1Dir := filepath.Join(root, "wt1")
+	ws1, err := vcs.Clone(ctx, repo, "", wt1Dir, pol)
+	if err != nil {
+		t.Fatalf("Clone wt1: %v", err)
+	}
+	if err := ws1.Branch("agent/ff-base"); err != nil {
+		t.Fatalf("Branch: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wt1Dir, "deploy/replicas.yaml"), []byte("replicas: 4\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ws1.Commit("feat: bump replicas to 4", vcs.Identity{}); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	rem.CommitOnBranch(t, "main", "chore: advance main", map[string]string{"OTHER.md": "ok\n"}, false)
+	if _, err := ws1.Publish(ctx, ""); err != nil {
+		t.Fatalf("Publish after base fast-forward failed: %v", err)
+	}
+
+	// 4. Publish fails with BASE_MOVED when remote main is rewritten after Clone.
+	wt2Dir := filepath.Join(root, "wt2")
+	ws2, err := vcs.Clone(ctx, repo, "", wt2Dir, pol)
+	if err != nil {
+		t.Fatalf("Clone wt2: %v", err)
+	}
+	if err := ws2.Branch("agent/rewritten-base"); err != nil {
+		t.Fatalf("Branch: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wt2Dir, "deploy/replicas.yaml"), []byte("replicas: 5\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ws2.Commit("feat: bump replicas to 5", vcs.Identity{}); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	rem.CommitOnBranch(t, "main", "rewrite main history", map[string]string{"README.md": "rewritten\n"}, true)
+	if _, err := ws2.Publish(ctx, ""); vcs.CodeOf(err) != vcs.CodeBaseMoved {
+		t.Errorf("Publish after base rewrite CodeOf = %q (%v), want %q", vcs.CodeOf(err), err, vcs.CodeBaseMoved)
 	}
 }
