@@ -21,6 +21,9 @@ profile.cov
 /.agents/sessions/
 /.agents/logs/
 
+# Feature worktrees under repo root.
+/.worktrees/
+
 # Local environment overrides.
 .env
 .env.local
