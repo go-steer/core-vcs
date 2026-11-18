@@ -280,6 +280,32 @@ func testVerbs(t *testing.T, cat *vcs.Catalog, c Case) {
 			t.Errorf("UpdateProposal Title = %q, want %q", up.Title, newTitle)
 		}
 	}
+	if serves(vcs.VerbProposalReview) {
+		// Stale ExpectedRevision must be refused with PROPOSAL_HEAD_MOVED.
+		_, err := repo.ReviewProposal(ctx, created.Number, vcs.ProposalReviewRequest{
+			Decision:         vcs.ReviewApprove,
+			Body:             "stale approval must not attach",
+			ExpectedRevision: "0000000000000000000000000000000000000000",
+		})
+		RequireError(t, err, vcs.CodeProposalHeadMoved, c.Forge.Name)
+
+		rv, err := repo.ReviewProposal(ctx, created.Number, vcs.ProposalReviewRequest{
+			Decision:         vcs.ReviewRequestChanges,
+			Body:             "please double-check replica bounds",
+			ExpectedRevision: created.Revision,
+			Comments: []vcs.ReviewLineComment{{
+				Path: "deploy/deployment.yaml",
+				Line: 5,
+				Body: "minReplicas should be >= 2",
+			}},
+		})
+		if err != nil {
+			t.Fatalf("ReviewProposal(request_changes): %v", err)
+		}
+		if rv.ID == "" || rv.Decision != vcs.ReviewRequestChanges || rv.Revision != created.Revision || rv.Author.Login == "" || rv.URL == "" || rv.SubmittedAt.IsZero() {
+			t.Errorf("ReviewProposal(request_changes) = %+v, want populated ID, Decision, Revision=%q, Author, URL, SubmittedAt", rv, created.Revision)
+		}
+	}
 	if serves(vcs.VerbProposalClose) {
 		closed, err := repo.CloseProposal(ctx, created.Number)
 		if err != nil {
@@ -287,6 +313,59 @@ func testVerbs(t *testing.T, cat *vcs.Catalog, c Case) {
 		}
 		if closed.State != vcs.ProposalClosed {
 			t.Errorf("CloseProposal State = %q, want %q", closed.State, vcs.ProposalClosed)
+		}
+	}
+	if serves(vcs.VerbProposalMerge) {
+		toMerge, err := repo.CreateProposal(ctx, vcs.ProposalRequest{
+			Source: "agent/fix-2",
+			Title:  "fix: bump request timeout",
+			Body:   "safe timeout increase",
+		})
+		if err != nil {
+			t.Fatalf("CreateProposal(fix-2): %v", err)
+		}
+		if serves(vcs.VerbProposalReview) {
+			approved, err := repo.ReviewProposal(ctx, toMerge.Number, vcs.ProposalReviewRequest{
+				Decision:         vcs.ReviewApprove,
+				Body:             "lgtm, bounds verified",
+				ExpectedRevision: toMerge.Revision,
+			})
+			if err != nil {
+				t.Fatalf("ReviewProposal(approve): %v", err)
+			}
+			if approved.ID == "" || approved.Decision != vcs.ReviewApprove || approved.Revision != toMerge.Revision {
+				t.Errorf("ReviewProposal(approve) = %+v, want approve at %q", approved, toMerge.Revision)
+			}
+		}
+
+		// Stale ExpectedRevision on merge must fail with PROPOSAL_HEAD_MOVED.
+		_, err = repo.MergeProposal(ctx, toMerge.Number, vcs.ProposalMergeRequest{
+			ExpectedRevision: "0000000000000000000000000000000000000000",
+			Method:           vcs.MergeSquash,
+		})
+		RequireError(t, err, vcs.CodeProposalHeadMoved, c.Forge.Name)
+
+		merged, err := repo.MergeProposal(ctx, toMerge.Number, vcs.ProposalMergeRequest{
+			ExpectedRevision:   toMerge.Revision,
+			Method:             vcs.MergeSquash,
+			CommitTitle:        "fix: bump request timeout",
+			CommitMessage:      "Reviewed and approved.",
+			DeleteSourceBranch: true,
+		})
+		if err != nil {
+			t.Fatalf("MergeProposal: %v", err)
+		}
+		if !merged.Merged || merged.Revision == "" || merged.Method != vcs.MergeSquash || merged.Proposal.Number != toMerge.Number || merged.Proposal.State != vcs.ProposalMerged {
+			t.Errorf("MergeProposal = %+v, want Merged=true, non-empty Revision, Method=squash, Proposal.State=merged", merged)
+		}
+		if serves(vcs.VerbProposalView) {
+			viewed, err := repo.GetProposal(ctx, toMerge.Number)
+			if err != nil {
+				t.Fatalf("GetProposal after merge: %v", err)
+			}
+			if viewed.State != vcs.ProposalMerged {
+				t.Errorf("GetProposal after merge State = %q, want %q", viewed.State, vcs.ProposalMerged)
+			}
 		}
 	}
 }
@@ -375,8 +454,19 @@ func callVerb(ctx context.Context, repo vcs.Repo, v vcs.Verb) error {
 	case vcs.VerbProposalClose:
 		_, err := repo.CloseProposal(ctx, 1)
 		return err
+	case vcs.VerbProposalReview:
+		_, err := repo.ReviewProposal(ctx, 1, vcs.ProposalReviewRequest{
+			Decision: vcs.ReviewApprove,
+			Body:     "lgtm",
+		})
+		return err
+	case vcs.VerbProposalMerge:
+		_, err := repo.MergeProposal(ctx, 1, vcs.ProposalMergeRequest{
+			ExpectedRevision: "0123456789abcdef0123456789abcdef01234567",
+		})
+		return err
 	default:
-		return nil
+		panic("vcstest.callVerb: unhandled ProposalVerb " + string(v))
 	}
 }
 

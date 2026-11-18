@@ -42,6 +42,10 @@ const (
 	VerbProposalClose Verb = "proposal-close"
 	// VerbProposalCommits lists the revisions a proposal carries.
 	VerbProposalCommits Verb = "proposal-commits"
+	// VerbProposalReview records a structured review decision on a proposal.
+	VerbProposalReview Verb = "proposal-review"
+	// VerbProposalMerge merges an open proposal into its target branch.
+	VerbProposalMerge Verb = "proposal-merge"
 )
 
 // ProposalVerbs is every verb that goes through a Provider, in a fixed
@@ -49,6 +53,7 @@ const (
 var ProposalVerbs = []Verb{
 	VerbProposalCreate, VerbProposalList, VerbProposalView, VerbProposalComments,
 	VerbProposalComment, VerbProposalUpdate, VerbProposalClose, VerbProposalCommits,
+	VerbProposalReview, VerbProposalMerge,
 }
 
 // Mutating reports whether v writes anywhere: the working copy, the remote
@@ -56,7 +61,7 @@ var ProposalVerbs = []Verb{
 func (v Verb) Mutating() bool {
 	switch v {
 	case VerbCommit, VerbPublish, VerbProposalCreate, VerbProposalComment,
-		VerbProposalUpdate, VerbProposalClose:
+		VerbProposalUpdate, VerbProposalClose, VerbProposalReview, VerbProposalMerge:
 		return true
 	default:
 		return false

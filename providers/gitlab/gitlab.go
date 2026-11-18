@@ -24,6 +24,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -75,6 +76,12 @@ type Options struct {
 type Provider struct {
 	opts Options
 }
+
+var (
+	_ vcs.Provider         = (*Provider)(nil)
+	_ vcs.ProposalReviewer = (*Provider)(nil)
+	_ vcs.ProposalMerger   = (*Provider)(nil)
+)
 
 // New constructs a GitLab Provider with default production settings.
 func New() (vcs.Provider, error) {
@@ -522,29 +529,484 @@ func (p *Provider) CloseProposal(ctx context.Context, repo vcs.Repo, number int)
 	return mr.toProposal(), nil
 }
 
+type glDiffPositionInput struct {
+	PositionType string `json:"position_type"`
+	BaseSHA      string `json:"base_sha"`
+	StartSHA     string `json:"start_sha"`
+	HeadSHA      string `json:"head_sha"`
+	NewPath      string `json:"new_path"`
+	NewLine      int    `json:"new_line"`
+}
+
+type glDiscussion struct {
+	ID    string   `json:"id"`
+	Notes []glNote `json:"notes"`
+}
+
+type glApprovalResponse struct {
+	ID              int64     `json:"id"`
+	IID             int       `json:"iid"`
+	SHA             string    `json:"sha"`
+	Approved        bool      `json:"approved"`
+	UserHasApproved bool      `json:"user_has_approved"`
+	UserCanApprove  bool      `json:"user_can_approve"`
+	UpdatedAt       time.Time `json:"updated_at"`
+	ApprovedBy      []struct {
+		User glUser `json:"user"`
+	} `json:"approved_by"`
+}
+
+// ReviewProposal implements vcs.ProposalReviewer by verifying
+// req.ExpectedRevision against the merge request's head SHA, posting inline
+// diff comments via POST /projects/{id}/merge_requests/{iid}/discussions and
+// summary commentary via POST /projects/{id}/merge_requests/{iid}/notes, and
+// recording approvals via POST /projects/{id}/merge_requests/{iid}/approve (or
+// revoking a prior approval on ReviewRequestChanges via POST .../unapprove).
+func (p *Provider) ReviewProposal(ctx context.Context, repo vcs.Repo, number int, req vcs.ProposalReviewRequest) (vcs.ProposalReview, error) {
+	switch req.Decision {
+	case vcs.ReviewApprove, vcs.ReviewRequestChanges, vcs.ReviewComment:
+	default:
+		return vcs.ProposalReview{}, vcs.Errorf(vcs.CodeForgeRejected, repo.Forge.Name, "unsupported review decision %q", req.Decision).WithVerb(vcs.VerbProposalReview)
+	}
+
+	expected := strings.TrimSpace(req.ExpectedRevision)
+	if req.ExpectedRevision != "" && expected == "" {
+		return vcs.ProposalReview{}, vcs.Errorf(vcs.CodeForgeRejected, repo.Forge.Name, "expected revision cannot be whitespace").WithVerb(vcs.VerbProposalReview)
+	}
+	body := strings.TrimSpace(req.Body)
+	if (req.Decision == vcs.ReviewRequestChanges || req.Decision == vcs.ReviewComment) && body == "" && len(req.Comments) == 0 {
+		return vcs.ProposalReview{}, vcs.Errorf(vcs.CodeForgeRejected, repo.Forge.Name, "%s review requires a non-empty body or at least one line comment", req.Decision).WithVerb(vcs.VerbProposalReview)
+	}
+	for i, c := range req.Comments {
+		if strings.TrimSpace(c.Path) == "" || c.Line <= 0 || strings.TrimSpace(c.Body) == "" {
+			return vcs.ProposalReview{}, vcs.Errorf(vcs.CodeForgeRejected, repo.Forge.Name, "review line comment %d requires a non-empty path, positive line, and non-empty body", i).WithVerb(vcs.VerbProposalReview)
+		}
+	}
+
+	var mr glMergeRequest
+	mrRoute := projectRoute(repo, fmt.Sprintf("/merge_requests/%d", number))
+	if err := p.doJSON(ctx, repo, vcs.VerbProposalReview, http.MethodGet, mrRoute, nil, &mr, notFoundAsUnsupported); err != nil {
+		return vcs.ProposalReview{}, err
+	}
+
+	headSHA := strings.TrimSpace(mr.SHA)
+	if headSHA == "" && mr.DiffRefs != nil {
+		headSHA = strings.TrimSpace(mr.DiffRefs.HeadSHA)
+	}
+	if expected != "" {
+		diffHead := ""
+		if mr.DiffRefs != nil {
+			diffHead = strings.TrimSpace(mr.DiffRefs.HeadSHA)
+		}
+		if (mr.SHA != "" && mr.SHA != expected) || (diffHead != "" && diffHead != expected) || (mr.SHA == "" && diffHead == "") {
+			actual := headSHA
+			if diffHead != "" && diffHead != expected {
+				actual = diffHead
+			}
+			return vcs.ProposalReview{}, vcs.Errorf(
+				vcs.CodeProposalHeadMoved,
+				repo.Forge.Name,
+				"merge request !%d SHA does not match HEAD of source branch: expected %s, remote head is %s",
+				number, expected, actual,
+			).WithVerb(vcs.VerbProposalReview)
+		}
+	}
+
+	var baseSHA, startSHA, diffHeadSHA string
+	if len(req.Comments) > 0 {
+		if mr.DiffRefs == nil || strings.TrimSpace(mr.DiffRefs.BaseSHA) == "" || strings.TrimSpace(mr.DiffRefs.HeadSHA) == "" {
+			return vcs.ProposalReview{}, vcs.Errorf(
+				vcs.CodeForgeRejected,
+				repo.Forge.Name,
+				"merge request !%d diff_refs are not yet available to anchor inline review comments",
+				number,
+			).WithVerb(vcs.VerbProposalReview)
+		}
+		baseSHA = strings.TrimSpace(mr.DiffRefs.BaseSHA)
+		diffHeadSHA = strings.TrimSpace(mr.DiffRefs.HeadSHA)
+		startSHA = strings.TrimSpace(mr.DiffRefs.StartSHA)
+		if startSHA == "" {
+			startSHA = baseSHA
+		}
+	}
+
+	// Post inline comments first and summary note second before calling /approve
+	// so a validation failure on a comment never leaves a premature approval.
+	var firstInlineNote glNote
+	if len(req.Comments) > 0 {
+		discRoute := projectRoute(repo, fmt.Sprintf("/merge_requests/%d/discussions", number))
+		for i, c := range req.Comments {
+			in := struct {
+				Body     string              `json:"body"`
+				Position glDiffPositionInput `json:"position"`
+			}{
+				Body: strings.TrimSpace(c.Body),
+				Position: glDiffPositionInput{
+					PositionType: "text",
+					BaseSHA:      baseSHA,
+					StartSHA:     startSHA,
+					HeadSHA:      diffHeadSHA,
+					NewPath:      strings.TrimSpace(c.Path),
+					NewLine:      c.Line,
+				},
+			}
+			var disc glDiscussion
+			if err := p.doJSON(ctx, repo, vcs.VerbProposalReview, http.MethodPost, discRoute, in, &disc, reviewOpMode); err != nil {
+				return vcs.ProposalReview{}, err
+			}
+			if i == 0 && len(disc.Notes) > 0 {
+				firstInlineNote = disc.Notes[0]
+			}
+		}
+	}
+
+	var summaryNote glNote
+	if body != "" {
+		noteRoute := projectRoute(repo, fmt.Sprintf("/merge_requests/%d/notes", number))
+		in := struct {
+			Body string `json:"body"`
+		}{Body: body}
+		if err := p.doJSON(ctx, repo, vcs.VerbProposalReview, http.MethodPost, noteRoute, in, &summaryNote, reviewOpMode); err != nil {
+			return vcs.ProposalReview{}, err
+		}
+	}
+
+	var approval glApprovalResponse
+	switch req.Decision {
+	case vcs.ReviewApprove:
+		var err error
+		approval, err = p.approveProposal(ctx, repo, number, expected)
+		if err != nil {
+			return vcs.ProposalReview{}, err
+		}
+	case vcs.ReviewRequestChanges:
+		if err := p.revokeApprovalIfPresent(ctx, repo, number); err != nil {
+			return vcs.ProposalReview{}, err
+		}
+	}
+
+	if expected != "" && req.Decision != vcs.ReviewApprove {
+		var postMR glMergeRequest
+		if err := p.doJSON(ctx, repo, vcs.VerbProposalReview, http.MethodGet, mrRoute, nil, &postMR, notFoundAsUnsupported); err != nil {
+			return vcs.ProposalReview{}, err
+		}
+		if postSHA := strings.TrimSpace(postMR.SHA); postSHA != "" && postSHA != expected {
+			return vcs.ProposalReview{}, vcs.Errorf(
+				vcs.CodeProposalHeadMoved,
+				repo.Forge.Name,
+				"merge request !%d head branch moved during review submission: expected %s, remote head is now %s",
+				number, expected, postSHA,
+			).WithVerb(vcs.VerbProposalReview)
+		}
+	}
+
+	rev := expected
+	if rev == "" {
+		rev = headSHA
+	}
+	if rev == "" && strings.TrimSpace(approval.SHA) != "" {
+		rev = strings.TrimSpace(approval.SHA)
+	}
+
+	out := vcs.ProposalReview{
+		Decision: req.Decision,
+		Body:     body,
+		Revision: rev,
+	}
+	switch {
+	case summaryNote.ID != 0:
+		out.ID = strconv.FormatInt(summaryNote.ID, 10)
+		out.Author = summaryNote.Author.toActor()
+		out.URL = noteWebURL(repo, mr.WebURL, number, summaryNote.ID)
+		out.SubmittedAt = summaryNote.CreatedAt
+	case firstInlineNote.ID != 0:
+		out.ID = strconv.FormatInt(firstInlineNote.ID, 10)
+		out.Author = firstInlineNote.Author.toActor()
+		out.URL = noteWebURL(repo, mr.WebURL, number, firstInlineNote.ID)
+		out.SubmittedAt = firstInlineNote.CreatedAt
+	default:
+		if approval.ID != 0 {
+			out.ID = fmt.Sprintf("approval-%d", approval.ID)
+		} else {
+			out.ID = fmt.Sprintf("approval-%d", number)
+		}
+		if len(approval.ApprovedBy) > 0 {
+			out.Author = approval.ApprovedBy[len(approval.ApprovedBy)-1].User.toActor()
+		}
+		out.URL = mrWebURL(repo, mr.WebURL, number)
+		out.SubmittedAt = approval.UpdatedAt
+		if out.SubmittedAt.IsZero() {
+			out.SubmittedAt = mr.UpdatedAt
+		}
+		if out.SubmittedAt.IsZero() {
+			out.SubmittedAt = time.Now().UTC()
+		}
+	}
+	return out, nil
+}
+
+func (p *Provider) approveProposal(ctx context.Context, repo vcs.Repo, number int, expected string) (glApprovalResponse, error) {
+	approveRoute := projectRoute(repo, fmt.Sprintf("/merge_requests/%d/approve", number))
+	var approveIn any
+	if expected != "" {
+		approveIn = struct {
+			SHA string `json:"sha"`
+		}{SHA: expected}
+	}
+	var approval glApprovalResponse
+	status, err := p.doJSONWithStatus(ctx, repo, vcs.VerbProposalReview, http.MethodPost, approveRoute, approveIn, &approval, reviewOpMode)
+	if err == nil {
+		return approval, nil
+	}
+	if status != http.StatusUnauthorized {
+		return glApprovalResponse{}, err
+	}
+
+	// GitLab POST /approve returns 401 both when the caller has already
+	// approved (non-idempotent retry) and when the caller cannot approve
+	// (e.g. author self-approval). Query GET /approvals to disambiguate both
+	// cases from a genuine credential failure.
+	approvalsRoute := projectRoute(repo, fmt.Sprintf("/merge_requests/%d/approvals", number))
+	var state glApprovalResponse
+	if getErr := p.doJSON(ctx, repo, vcs.VerbProposalReview, http.MethodGet, approvalsRoute, nil, &state, reviewOpMode); getErr != nil {
+		return glApprovalResponse{}, err
+	}
+	if expected != "" && strings.TrimSpace(state.SHA) != "" && strings.TrimSpace(state.SHA) != expected {
+		return glApprovalResponse{}, vcs.Errorf(
+			vcs.CodeProposalHeadMoved,
+			repo.Forge.Name,
+			"merge request !%d SHA does not match HEAD of source branch: expected %s, remote head is %s",
+			number, expected, strings.TrimSpace(state.SHA),
+		).WithVerb(vcs.VerbProposalReview)
+	}
+	if state.UserHasApproved {
+		return state, nil
+	}
+	if !state.UserCanApprove {
+		return glApprovalResponse{}, vcs.Errorf(
+			vcs.CodeForgeRejected,
+			repo.Forge.Name,
+			"merge request !%d cannot be approved by the current identity (user_can_approve=false, e.g. author self-approval or approval rule restriction): %s",
+			number, errDetail(err),
+		).WithVerb(vcs.VerbProposalReview)
+	}
+	return glApprovalResponse{}, err
+}
+
+func (p *Provider) revokeApprovalIfPresent(ctx context.Context, repo vcs.Repo, number int) error {
+	unapproveRoute := projectRoute(repo, fmt.Sprintf("/merge_requests/%d/unapprove", number))
+	status, err := p.doJSONWithStatus(ctx, repo, vcs.VerbProposalReview, http.MethodPost, unapproveRoute, nil, nil, reviewOpMode)
+	if err == nil || status == http.StatusNotFound {
+		return nil
+	}
+	if status == http.StatusUnauthorized || status == http.StatusMethodNotAllowed || status == http.StatusUnprocessableEntity {
+		approvalsRoute := projectRoute(repo, fmt.Sprintf("/merge_requests/%d/approvals", number))
+		var state glApprovalResponse
+		if getErr := p.doJSON(ctx, repo, vcs.VerbProposalReview, http.MethodGet, approvalsRoute, nil, &state, reviewOpMode); getErr == nil && !state.UserHasApproved {
+			return nil
+		}
+	}
+	return err
+}
+
+// MergeProposal implements vcs.ProposalMerger via
+// PUT /projects/{id}/merge_requests/{iid}/merge.
+func (p *Provider) MergeProposal(ctx context.Context, repo vcs.Repo, number int, req vcs.ProposalMergeRequest) (vcs.ProposalMergeResult, error) {
+	expected := strings.TrimSpace(req.ExpectedRevision)
+	if expected == "" {
+		return vcs.ProposalMergeResult{}, vcs.Errorf(vcs.CodeForgeRejected, repo.Forge.Name, "expected revision is required to merge a proposal").WithVerb(vcs.VerbProposalMerge)
+	}
+
+	var squash *bool
+	switch req.Method {
+	case vcs.MergeDefault:
+	case vcs.MergeCreateCommit:
+		v := false
+		squash = &v
+	case vcs.MergeSquash:
+		v := true
+		squash = &v
+	case vcs.MergeRebase:
+		return vcs.ProposalMergeResult{}, vcs.Errorf(
+			vcs.CodeForgeUnsupported,
+			repo.Forge.Name,
+			"GitLab merge endpoint does not support per-request %q merges; use merge, squash, or the project default",
+			vcs.MergeRebase,
+		).WithVerb(vcs.VerbProposalMerge)
+	default:
+		return vcs.ProposalMergeResult{}, vcs.Errorf(vcs.CodeForgeRejected, repo.Forge.Name, "unsupported merge method %q", req.Method).WithVerb(vcs.VerbProposalMerge)
+	}
+
+	customMsg := composeCommitMessage(req.CommitTitle, req.CommitMessage)
+	var mergeMsg, squashMsg string
+	switch req.Method {
+	case vcs.MergeSquash:
+		squashMsg = customMsg
+	case vcs.MergeCreateCommit:
+		mergeMsg = customMsg
+	default:
+		mergeMsg = customMsg
+		squashMsg = customMsg
+	}
+
+	in := struct {
+		SHA                      string `json:"sha"`
+		Squash                   *bool  `json:"squash,omitempty"`
+		MergeCommitMessage       string `json:"merge_commit_message,omitempty"`
+		SquashCommitMessage      string `json:"squash_commit_message,omitempty"`
+		ShouldRemoveSourceBranch bool   `json:"should_remove_source_branch,omitempty"`
+	}{
+		SHA:                      expected,
+		Squash:                   squash,
+		MergeCommitMessage:       mergeMsg,
+		SquashCommitMessage:      squashMsg,
+		ShouldRemoveSourceBranch: req.DeleteSourceBranch,
+	}
+
+	var mr glMergeRequest
+	route := projectRoute(repo, fmt.Sprintf("/merge_requests/%d/merge", number))
+	if status, err := p.doJSONWithStatus(ctx, repo, vcs.VerbProposalMerge, http.MethodPut, route, in, &mr, mergeOpMode); err != nil {
+		if (status == http.StatusMethodNotAllowed || status == http.StatusNotAcceptable || status == http.StatusUnprocessableEntity) && !vcs.IsCode(err, vcs.CodeProposalHeadMoved) {
+			return vcs.ProposalMergeResult{}, p.classifyMergeFailure(ctx, repo, number, err)
+		}
+		return vcs.ProposalMergeResult{}, err
+	}
+	if !strings.EqualFold(mr.State, "merged") {
+		return vcs.ProposalMergeResult{}, vcs.Errorf(
+			vcs.CodeForgeRejected,
+			repo.Forge.Name,
+			"merge request !%d was not merged immediately (state=%q)",
+			number, mr.State,
+		).WithVerb(vcs.VerbProposalMerge)
+	}
+
+	rev := strings.TrimSpace(mr.MergeCommitSHA)
+	if req.Method == vcs.MergeSquash && strings.TrimSpace(mr.SquashCommitSHA) != "" {
+		rev = strings.TrimSpace(mr.SquashCommitSHA)
+	} else if rev == "" && strings.TrimSpace(mr.SquashCommitSHA) != "" {
+		rev = strings.TrimSpace(mr.SquashCommitSHA)
+	}
+	if rev == "" {
+		rev = strings.TrimSpace(mr.SHA)
+	}
+
+	prop := mr.toProposal()
+	prop.State = vcs.ProposalMerged
+	return vcs.ProposalMergeResult{
+		Merged:   true,
+		Revision: rev,
+		Method:   req.Method,
+		Proposal: prop,
+	}, nil
+}
+
+// classifyMergeFailure inspects detailed_merge_status on the merge request
+// when PUT /merge returns a generic 405, 406, or 422 response so policy/check
+// blocks (not_approved, ci_must_pass, discussions_not_resolved, ...) become
+// PROTECTED_BRANCH while structural refusals (draft_status, conflict, ...)
+// remain FORGE_REJECTED.
+func (p *Provider) classifyMergeFailure(ctx context.Context, repo vcs.Repo, number int, mergeErr error) error {
+	detail := errDetail(mergeErr)
+	var curMR glMergeRequest
+	mrRoute := projectRoute(repo, fmt.Sprintf("/merge_requests/%d", number))
+	if err := p.doJSON(ctx, repo, vcs.VerbProposalMerge, http.MethodGet, mrRoute, nil, &curMR, notFoundAsUnsupported); err != nil {
+		return mergeErr
+	}
+	dms := strings.ToLower(strings.TrimSpace(curMR.DetailedMergeStatus))
+	switch dms {
+	case "not_approved",
+		"approvals_syncing",
+		"requested_changes",
+		"ci_must_pass",
+		"ci_still_running",
+		"discussions_not_resolved",
+		"external_status_checks",
+		"blocked_status",
+		"security_policy_violations",
+		"jira_association_missing":
+		return vcs.Errorf(vcs.CodeProtectedBranch, repo.Forge.Name, "%s (detailed_merge_status=%s)", detail, dms).WithVerb(vcs.VerbProposalMerge)
+	case "draft_status",
+		"not_open",
+		"conflict",
+		"need_rebase",
+		"broken_status",
+		"commits_status":
+		return vcs.Errorf(vcs.CodeForgeRejected, repo.Forge.Name, "%s (detailed_merge_status=%s)", detail, dms).WithVerb(vcs.VerbProposalMerge)
+	case "checking", "preparing", "unchecked":
+		return vcs.Errorf(vcs.CodeForgeUnavailable, repo.Forge.Name, "%s (detailed_merge_status=%s); retry after mergeability check completes", detail, dms).WithVerb(vcs.VerbProposalMerge)
+	}
+	if curMR.Draft || curMR.WorkInProgress || hasDraftPrefix(curMR.Title) {
+		return vcs.Errorf(vcs.CodeForgeRejected, repo.Forge.Name, "%s", detail).WithVerb(vcs.VerbProposalMerge)
+	}
+	return mergeErr
+}
+
+func errDetail(err error) string {
+	var ve *vcs.Error
+	if errors.As(err, &ve) && ve.Detail != "" {
+		return ve.Detail
+	}
+	return err.Error()
+}
+
+func composeCommitMessage(title, body string) string {
+	t := strings.TrimSpace(title)
+	b := strings.TrimSpace(body)
+	switch {
+	case t != "" && b != "":
+		return t + "\n\n" + b
+	case t != "":
+		return t
+	default:
+		return b
+	}
+}
+
+func mrWebURL(repo vcs.Repo, webURL string, mrIID int) string {
+	if strings.TrimSpace(webURL) != "" {
+		return strings.TrimSpace(webURL)
+	}
+	scheme := repo.Forge.Scheme
+	if scheme == "" {
+		scheme = "https"
+	}
+	return fmt.Sprintf("%s://%s/%s/-/merge_requests/%d", scheme, repo.Ref.Host, repo.Ref.Path, mrIID)
+}
+
+func noteWebURL(repo vcs.Repo, webURL string, mrIID int, noteID int64) string {
+	return fmt.Sprintf("%s#note_%d", mrWebURL(repo, webURL, mrIID), noteID)
+}
+
 type notFoundMode int
 
 const (
 	notFoundAsUnsupported notFoundMode = iota
 	notFoundAsBaseBranchMissing
+	reviewOpMode
+	mergeOpMode
 )
 
 func (p *Provider) doJSON(ctx context.Context, repo vcs.Repo, verb vcs.Verb, method, route string, in, out any, nfMode notFoundMode) error {
+	_, err := p.doJSONWithStatus(ctx, repo, verb, method, route, in, out, nfMode)
+	return err
+}
+
+func (p *Provider) doJSONWithStatus(ctx context.Context, repo vcs.Repo, verb vcs.Verb, method, route string, in, out any, nfMode notFoundMode) (int, error) {
 	client, err := vcs.NewHTTPClient(repo.Forge)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	var body io.Reader
 	if in != nil {
 		b, err := json.Marshal(in)
 		if err != nil {
-			return vcs.Errorf(vcs.CodeForgeCallFailed, repo.Forge.Name, "marshal request: %w", err).WithVerb(verb)
+			return 0, vcs.Errorf(vcs.CodeForgeCallFailed, repo.Forge.Name, "marshal request: %w", err).WithVerb(verb)
 		}
 		body = bytes.NewReader(b)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, p.APIBaseURL(repo.Forge)+route, body)
 	if err != nil {
-		return vcs.Errorf(vcs.CodeForgeCallFailed, repo.Forge.Name, "%w", err).WithVerb(verb)
+		return 0, vcs.Errorf(vcs.CodeForgeCallFailed, repo.Forge.Name, "%w", err).WithVerb(verb)
 	}
 	if in != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -556,28 +1018,28 @@ func (p *Provider) doJSON(ctx context.Context, repo vcs.Repo, verb vcs.Verb, met
 			if code == "" {
 				code = vcs.CodeConfigInvalid
 			}
-			return vcs.Errorf(code, repo.Forge.Name, "%w", err).WithVerb(verb)
+			return 0, vcs.Errorf(code, repo.Forge.Name, "%w", err).WithVerb(verb)
 		}
 		req.Header.Set(PrivateTokenHeader, tok)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return vcs.TransportError(repo.Forge, verb, err)
+		return 0, vcs.TransportError(repo.Forge, verb, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
-		return vcs.TransportError(repo.Forge, verb, err)
+		return resp.StatusCode, vcs.TransportError(repo.Forge, verb, err)
 	}
 	if resp.StatusCode >= 300 {
-		return classifyError(repo.Forge.Name, verb, resp, raw, nfMode)
+		return resp.StatusCode, classifyError(repo.Forge.Name, verb, resp, raw, nfMode)
 	}
 	if out != nil && len(raw) > 0 {
 		if err := json.Unmarshal(raw, out); err != nil {
-			return vcs.Errorf(vcs.CodeForgeCallFailed, repo.Forge.Name, "decode response: %w", err).WithVerb(verb)
+			return resp.StatusCode, vcs.Errorf(vcs.CodeForgeCallFailed, repo.Forge.Name, "decode response: %w", err).WithVerb(verb)
 		}
 	}
-	return nil
+	return resp.StatusCode, nil
 }
 
 type glErrorPayload struct {
@@ -634,10 +1096,46 @@ func classifyError(forge string, verb vcs.Verb, resp *http.Response, body []byte
 		}
 		return vcs.Errorf(vcs.CodeForgeUnsupported, forge, "%s", detail).WithVerb(verb)
 
+	case http.StatusMethodNotAllowed, http.StatusNotAcceptable:
+		if nfMode == mergeOpMode {
+			if isGitLabProtectionBlocked(detail) {
+				return vcs.Errorf(vcs.CodeProtectedBranch, forge, "%s", detail).WithVerb(verb)
+			}
+			return vcs.Errorf(vcs.CodeForgeRejected, forge, "%s", detail).WithVerb(verb)
+		}
+		if nfMode == reviewOpMode {
+			return vcs.Errorf(vcs.CodeForgeRejected, forge, "%s", detail).WithVerb(verb)
+		}
+		return vcs.Errorf(vcs.CodeForgeCallFailed, forge, "HTTP %d: %s", resp.StatusCode, detail).WithVerb(verb)
+
+	case http.StatusConflict:
+		if nfMode == reviewOpMode || nfMode == mergeOpMode {
+			if isGitLabHeadMismatch(detail) {
+				return vcs.Errorf(vcs.CodeProposalHeadMoved, forge, "%s", detail).WithVerb(verb)
+			}
+			return vcs.Errorf(vcs.CodeForgeRejected, forge, "%s", detail).WithVerb(verb)
+		}
+		return vcs.Errorf(vcs.CodeForgeRejected, forge, "%s; fix the request fields", detail).WithVerb(verb)
+
 	case http.StatusUnprocessableEntity:
+		if nfMode == mergeOpMode {
+			if isGitLabHeadMismatch(detail) {
+				return vcs.Errorf(vcs.CodeProposalHeadMoved, forge, "%s", detail).WithVerb(verb)
+			}
+			if isGitLabProtectionBlocked(detail) {
+				return vcs.Errorf(vcs.CodeProtectedBranch, forge, "%s", detail).WithVerb(verb)
+			}
+			return vcs.Errorf(vcs.CodeForgeRejected, forge, "%s", detail).WithVerb(verb)
+		}
+		if nfMode == reviewOpMode {
+			return vcs.Errorf(vcs.CodeForgeRejected, forge, "%s", detail).WithVerb(verb)
+		}
 		return vcs.Errorf(vcs.CodeForgeCallFailed, forge, "%s", detail).WithVerb(verb)
 
-	case http.StatusBadRequest, http.StatusConflict:
+	case http.StatusBadRequest:
+		if nfMode == reviewOpMode || nfMode == mergeOpMode {
+			return vcs.Errorf(vcs.CodeForgeRejected, forge, "%s", detail).WithVerb(verb)
+		}
 		return vcs.Errorf(vcs.CodeForgeRejected, forge, "%s; fix the request fields", detail).WithVerb(verb)
 
 	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
@@ -649,6 +1147,54 @@ func classifyError(forge string, verb vcs.Verb, resp *http.Response, body []byte
 	default:
 		return vcs.Errorf(vcs.CodeForgeCallFailed, forge, "HTTP %d: %s", resp.StatusCode, detail).WithVerb(verb)
 	}
+}
+
+func isGitLabHeadMismatch(detail string) bool {
+	lower := strings.ToLower(strings.TrimSpace(detail))
+	if (strings.Contains(lower, "conflict") && !strings.EqualFold(lower, strings.ToLower(http.StatusText(http.StatusConflict)))) ||
+		(strings.Contains(lower, "cannot be merged") && !strings.Contains(lower, "sha")) {
+		return false
+	}
+	return strings.EqualFold(lower, strings.ToLower(http.StatusText(http.StatusConflict))) ||
+		strings.Contains(lower, "sha does not match") ||
+		strings.Contains(lower, "sha mismatch") ||
+		strings.Contains(lower, "head of source branch") ||
+		strings.Contains(lower, "head branch was modified") ||
+		strings.Contains(lower, "expected sha")
+}
+
+func isGitLabProtectionBlocked(detail string) bool {
+	lower := strings.ToLower(detail)
+	if strings.Contains(lower, "draft") ||
+		strings.Contains(lower, "work in progress") ||
+		strings.Contains(lower, "wip") ||
+		strings.Contains(lower, "merge conflict") ||
+		strings.Contains(lower, "has conflicts") ||
+		strings.Contains(lower, "already merged") ||
+		strings.Contains(lower, "closed") ||
+		strings.Contains(lower, "no changes") {
+		return false
+	}
+	for _, marker := range []string{
+		"protected branch",
+		"branch protection",
+		"approv",
+		"code owner",
+		"pipeline",
+		"status check",
+		"external status",
+		"discussions must be resolved",
+		"unresolved discussion",
+		"threads must be resolved",
+		"not allowed to merge",
+		"merge request rule",
+		"blocked",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func rateLimitResetHint(resp *http.Response, msg string) string {
@@ -682,21 +1228,31 @@ func (u glUser) toActor() vcs.Actor {
 	}
 }
 
+type glDiffRefs struct {
+	BaseSHA  string `json:"base_sha"`
+	StartSHA string `json:"start_sha"`
+	HeadSHA  string `json:"head_sha"`
+}
+
 type glMergeRequest struct {
-	IID            int       `json:"iid"`
-	WebURL         string    `json:"web_url"`
-	Title          string    `json:"title"`
-	Description    string    `json:"description"`
-	State          string    `json:"state"`
-	Draft          bool      `json:"draft"`
-	WorkInProgress bool      `json:"work_in_progress"`
-	SourceBranch   string    `json:"source_branch"`
-	TargetBranch   string    `json:"target_branch"`
-	SHA            string    `json:"sha"`
-	Author         glUser    `json:"author"`
-	Labels         []string  `json:"labels"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	IID                 int         `json:"iid"`
+	WebURL              string      `json:"web_url"`
+	Title               string      `json:"title"`
+	Description         string      `json:"description"`
+	State               string      `json:"state"`
+	Draft               bool        `json:"draft"`
+	WorkInProgress      bool        `json:"work_in_progress"`
+	DetailedMergeStatus string      `json:"detailed_merge_status"`
+	SourceBranch        string      `json:"source_branch"`
+	TargetBranch        string      `json:"target_branch"`
+	SHA                 string      `json:"sha"`
+	MergeCommitSHA      string      `json:"merge_commit_sha"`
+	SquashCommitSHA     string      `json:"squash_commit_sha"`
+	DiffRefs            *glDiffRefs `json:"diff_refs"`
+	Author              glUser      `json:"author"`
+	Labels              []string    `json:"labels"`
+	CreatedAt           time.Time   `json:"created_at"`
+	UpdatedAt           time.Time   `json:"updated_at"`
 }
 
 func (mr glMergeRequest) toProposal() vcs.Proposal {

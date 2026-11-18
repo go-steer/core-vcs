@@ -68,6 +68,12 @@ type Provider struct {
 	opts Options
 }
 
+var (
+	_ vcs.Provider         = (*Provider)(nil)
+	_ vcs.ProposalReviewer = (*Provider)(nil)
+	_ vcs.ProposalMerger   = (*Provider)(nil)
+)
+
 // New returns a Constructor with the default options: all proposal verbs,
 // labels enabled, noun "change proposal".
 func New(opts Options) vcs.Constructor {
@@ -263,6 +269,22 @@ func (p *Provider) CloseProposal(ctx context.Context, repo vcs.Repo, number int)
 	return out, err
 }
 
+// ReviewProposal implements vcs.ProposalReviewer.
+func (p *Provider) ReviewProposal(ctx context.Context, repo vcs.Repo, number int, req vcs.ProposalReviewRequest) (vcs.ProposalReview, error) {
+	var out vcs.ProposalReview
+	path := fmt.Sprintf("/api/repos/%s/proposals/%d/reviews", repo.Ref.Path, number)
+	err := p.call(ctx, repo, vcs.VerbProposalReview, http.MethodPost, path, req, &out)
+	return out, err
+}
+
+// MergeProposal implements vcs.ProposalMerger.
+func (p *Provider) MergeProposal(ctx context.Context, repo vcs.Repo, number int, req vcs.ProposalMergeRequest) (vcs.ProposalMergeResult, error) {
+	var out vcs.ProposalMergeResult
+	path := fmt.Sprintf("/api/repos/%s/proposals/%d/merge", repo.Ref.Path, number)
+	err := p.call(ctx, repo, vcs.VerbProposalMerge, http.MethodPut, path, req, &out)
+	return out, err
+}
+
 func (p *Provider) baseURL(f vcs.Forge) string {
 	if p.opts.DialURL != "" {
 		return strings.TrimRight(p.opts.DialURL, "/")
@@ -324,6 +346,7 @@ func (p *Provider) call(ctx context.Context, repo vcs.Repo, verb vcs.Verb, metho
 
 func classifyHTTP(forge string, verb vcs.Verb, resp *http.Response, body []byte) error {
 	var payload struct {
+		Code    string `json:"code"`
 		Message string `json:"message"`
 	}
 	_ = json.Unmarshal(body, &payload)
@@ -341,7 +364,24 @@ func classifyHTTP(forge string, verb vcs.Verb, resp *http.Response, body []byte)
 		return vcs.Errorf(vcs.CodeForgeUnauthorized, forge, "%s; the credential lacks permission, do not retry", msg).WithVerb(verb)
 	case http.StatusNotFound:
 		return vcs.Errorf(vcs.CodeForgeRejected, forge, "not found: %s", msg).WithVerb(verb)
-	case http.StatusUnprocessableEntity, http.StatusConflict, http.StatusBadRequest:
+	case http.StatusMethodNotAllowed:
+		lower := strings.ToLower(msg)
+		if payload.Code == string(vcs.CodeProtectedBranch) ||
+			strings.Contains(lower, "protected branch") ||
+			strings.Contains(lower, "approving review") ||
+			strings.Contains(lower, "status check") {
+			return vcs.Errorf(vcs.CodeProtectedBranch, forge, "%s", msg).WithVerb(verb)
+		}
+		return vcs.Errorf(vcs.CodeForgeRejected, forge, "%s", msg).WithVerb(verb)
+	case http.StatusConflict:
+		lower := strings.ToLower(msg)
+		if payload.Code == string(vcs.CodeProposalHeadMoved) ||
+			((verb == vcs.VerbProposalReview || verb == vcs.VerbProposalMerge) &&
+				(strings.Contains(lower, "head") || strings.Contains(lower, "sha") || strings.Contains(lower, "revision"))) {
+			return vcs.Errorf(vcs.CodeProposalHeadMoved, forge, "%s", msg).WithVerb(verb)
+		}
+		return vcs.Errorf(vcs.CodeForgeRejected, forge, "%s; fix the request fields", msg).WithVerb(verb)
+	case http.StatusUnprocessableEntity, http.StatusBadRequest:
 		return vcs.Errorf(vcs.CodeForgeRejected, forge, "%s; fix the request fields", msg).WithVerb(verb)
 	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 		return vcs.Errorf(vcs.CodeForgeUnavailable, forge, "%s; retry the call", msg).WithVerb(verb)
@@ -360,6 +400,7 @@ type Fixture struct {
 	nextErr   *forcedResponse
 	proposals map[int]*vcs.Proposal
 	comments  map[int][]vcs.Comment
+	reviews   map[int][]vcs.ProposalReview
 	protected map[string]bool
 	base      string
 }
@@ -400,6 +441,7 @@ func newFixture() *Fixture {
 	return &Fixture{
 		proposals: map[int]*vcs.Proposal{},
 		comments:  map[int][]vcs.Comment{},
+		reviews:   map[int][]vcs.ProposalReview{},
 		protected: map[string]bool{"main": true},
 		base:      "main",
 	}
@@ -566,6 +608,85 @@ func (fx *Fixture) serveProposal(w http.ResponseWriter, r *http.Request, n int, 
 				Author:   vcs.Identity{Name: "platform-agent", Email: "bot@example"},
 				When:     p.CreatedAt,
 			}},
+		})
+
+	case len(sub) == 1 && sub[0] == "reviews" && r.Method == http.MethodPost:
+		var req vcs.ProposalReviewRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if req.ExpectedRevision != "" && req.ExpectedRevision != p.Revision {
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"code":    string(vcs.CodeProposalHeadMoved),
+				"message": fmt.Sprintf("head branch was modified: expected %s, got %s", req.ExpectedRevision, p.Revision),
+			})
+			return
+		}
+		for _, lc := range req.Comments {
+			id := len(fx.comments[n]) + 1
+			fx.comments[n] = append(fx.comments[n], vcs.Comment{
+				ID:        strconv.Itoa(id),
+				Kind:      vcs.CommentReviewComment,
+				Author:    vcs.Actor{Login: "reviewer-agent", Bot: true},
+				Body:      lc.Body,
+				Path:      lc.Path,
+				Line:      lc.Line,
+				URL:       fmt.Sprintf("%s#review-comment-%d", p.URL, id),
+				CreatedAt: p.UpdatedAt,
+			})
+		}
+		if req.Body != "" {
+			id := len(fx.comments[n]) + 1
+			fx.comments[n] = append(fx.comments[n], vcs.Comment{
+				ID:        strconv.Itoa(id),
+				Kind:      vcs.CommentReview,
+				Author:    vcs.Actor{Login: "reviewer-agent", Bot: true},
+				Body:      req.Body,
+				URL:       fmt.Sprintf("%s#review-summary-%d", p.URL, id),
+				CreatedAt: p.UpdatedAt,
+			})
+		}
+		revID := len(fx.reviews[n]) + 1
+		rv := vcs.ProposalReview{
+			ID:          strconv.Itoa(revID),
+			Decision:    req.Decision,
+			Author:      vcs.Actor{Login: "reviewer-agent", Bot: true},
+			Body:        req.Body,
+			Revision:    p.Revision,
+			URL:         fmt.Sprintf("%s#review-%d", p.URL, revID),
+			SubmittedAt: p.UpdatedAt,
+		}
+		fx.reviews[n] = append(fx.reviews[n], rv)
+		writeJSON(w, http.StatusCreated, rv)
+
+	case len(sub) == 1 && sub[0] == "merge" && r.Method == http.MethodPut:
+		var req vcs.ProposalMergeRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if p.State != vcs.ProposalOpen {
+			writeError(w, http.StatusMethodNotAllowed, "proposal is not open")
+			return
+		}
+		if p.Draft {
+			writeError(w, http.StatusMethodNotAllowed, "proposal is still a draft")
+			return
+		}
+		if req.ExpectedRevision != "" && req.ExpectedRevision != p.Revision {
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"code":    string(vcs.CodeProposalHeadMoved),
+				"message": fmt.Sprintf("head branch was modified: expected %s, got %s", req.ExpectedRevision, p.Revision),
+			})
+			return
+		}
+		p.State = vcs.ProposalMerged
+		writeJSON(w, http.StatusOK, vcs.ProposalMergeResult{
+			Merged:   true,
+			Revision: "9876543210fedcba9876543210fedcba98765432",
+			Method:   req.Method,
+			Proposal: *p,
 		})
 
 	default:

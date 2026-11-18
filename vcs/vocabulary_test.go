@@ -39,18 +39,41 @@ var forgeReviewSpelling = regexp.MustCompile(
 		`|(^(PR|MR)([A-Z][a-z]|s\b|[0-9]|$))`,
 )
 
+// hasForgeReviewSpelling reports whether s contains a forge-specific proposal
+// noun. Only the exact #20 type name ProposalMergeRequest (Proposal noun +
+// Merge verb + Request struct suffix, parallel to ProposalReviewRequest) is
+// exempted; any compound identifier containing MergeRequest (such as
+// ProposalMergeRequestURL, ProposalMergeRequests, or MergeRequest) still fails.
+func hasForgeReviewSpelling(s string) bool {
+	if s == "ProposalMergeRequest" {
+		return false
+	}
+	return forgeReviewSpelling.MatchString(s)
+}
+
 func TestNeutralVocabularyEverywhereExported(t *testing.T) {
 	t.Parallel()
 
-	// Non-vacuous self-check on the regex.
-	for _, bad := range []string{"CreatePR", "PRNumber", "OpenMR", "PullRequest", "merge_request", "ListPRs", "PR_NUMBER", "mr-list"} {
-		if !forgeReviewSpelling.MatchString(bad) {
-			t.Fatalf("forgeReviewSpelling failed to match banned sample %q", bad)
+	// Non-vacuous self-check on the matcher.
+	for _, bad := range []string{
+		"CreatePR", "PRNumber", "OpenMR", "PullRequest", "MergeRequest",
+		"CreateMergeRequest", "MergeRequestProposal", "ProposalPullRequest",
+		"ProposalMergeRequestURL", "ProposalMergeRequests", "NewProposalMergeRequest",
+		"ProposalMergeRequestPR", "MRProposalMergeRequest",
+		"merge_request", "ListPRs", "PR_NUMBER", "mr-list",
+	} {
+		if !hasForgeReviewSpelling(bad) {
+			t.Fatalf("hasForgeReviewSpelling failed to match banned sample %q", bad)
 		}
 	}
-	for _, ok := range []string{"CreateProposal", "PrimaryRepo", "ParseRepoRef", "ProposalRequest", "PROTECTED_BRANCH", "proposal-create"} {
-		if forgeReviewSpelling.MatchString(ok) {
-			t.Fatalf("forgeReviewSpelling false-positived on %q", ok)
+	for _, ok := range []string{
+		"CreateProposal", "PrimaryRepo", "ParseRepoRef", "ProposalRequest",
+		"ProposalReviewRequest", "ProposalMergeRequest", "ProposalMergeResult",
+		"MergeProposal", "PROTECTED_BRANCH", "PROPOSAL_HEAD_MOVED",
+		"proposal-create", "proposal-review", "proposal-merge",
+	} {
+		if hasForgeReviewSpelling(ok) {
+			t.Fatalf("hasForgeReviewSpelling false-positived on %q", ok)
 		}
 	}
 
@@ -86,7 +109,7 @@ func TestNeutralVocabularyEverywhereExported(t *testing.T) {
 				return true
 			}
 			checked++
-			if forgeReviewSpelling.MatchString(id.Name) {
+			if hasForgeReviewSpelling(id.Name) {
 				p := fset.Position(id.Pos())
 				t.Errorf("%s:%d: exported identifier %q uses forge-specific review vocabulary; use Proposal", rel, p.Line, id.Name)
 			}
@@ -102,12 +125,12 @@ func TestNeutralVocabularyEverywhereExported(t *testing.T) {
 	}
 
 	for _, c := range vcs.Codes {
-		if forgeReviewSpelling.MatchString(string(c)) {
+		if hasForgeReviewSpelling(string(c)) {
 			t.Errorf("Code %q uses forge-specific vocabulary", c)
 		}
 	}
 	for _, v := range vcs.ProposalVerbs {
-		if forgeReviewSpelling.MatchString(string(v)) {
+		if hasForgeReviewSpelling(string(v)) {
 			t.Errorf("Verb %q uses forge-specific vocabulary", v)
 		}
 	}

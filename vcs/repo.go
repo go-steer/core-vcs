@@ -117,6 +117,21 @@ func (r Repo) staticCapabilities() Capabilities {
 	if caps.ProposalNoun == "" {
 		caps.ProposalNoun = ProposalNounMissing
 	}
+	_, canReview := r.provider.(ProposalReviewer)
+	_, canMerge := r.provider.(ProposalMerger)
+	if len(caps.Verbs) > 0 && (!canReview || !canMerge) {
+		filtered := make([]Verb, 0, len(caps.Verbs))
+		for _, v := range caps.Verbs {
+			if v == VerbProposalReview && !canReview {
+				continue
+			}
+			if v == VerbProposalMerge && !canMerge {
+				continue
+			}
+			filtered = append(filtered, v)
+		}
+		caps.Verbs = filtered
+	}
 	var missing []Verb
 	for _, v := range ProposalVerbs {
 		if !caps.Serves(v) {
@@ -256,6 +271,87 @@ func (r Repo) CloseProposal(ctx context.Context, number int) (Proposal, error) {
 	}
 	p, err := r.provider.CloseProposal(ctx, r, number)
 	return p, r.wrap(VerbProposalClose, err)
+}
+
+// ReviewProposal records a structured review decision (approve,
+// request_changes, or comment) on an open proposal.
+func (r Repo) ReviewProposal(ctx context.Context, number int, req ProposalReviewRequest) (ProposalReview, error) {
+	caps, err := r.gate(VerbProposalReview, false)
+	if err != nil {
+		return ProposalReview{}, err
+	}
+	reviewer, ok := r.provider.(ProposalReviewer)
+	if !ok {
+		return ProposalReview{}, Errorf(CodeForgeUnsupported, r.Forge.Name, "forge %q (%s) does not support %s (proposalNoun: %s)", r.Forge.Name, r.provider.Name(), VerbProposalReview, caps.ProposalNoun).WithVerb(VerbProposalReview)
+	}
+	if err := checkNumber(r.Forge.Name, VerbProposalReview, number); err != nil {
+		return ProposalReview{}, err
+	}
+	switch req.Decision {
+	case ReviewApprove, ReviewRequestChanges, ReviewComment:
+	default:
+		return ProposalReview{}, Errorf(CodeForgeRejected, r.Forge.Name, "review decision %q must be %q, %q, or %q", req.Decision, ReviewApprove, ReviewRequestChanges, ReviewComment).WithVerb(VerbProposalReview)
+	}
+	if req.ExpectedRevision != "" {
+		trimmedRev := strings.TrimSpace(req.ExpectedRevision)
+		if trimmedRev == "" {
+			return ProposalReview{}, Errorf(CodeForgeRejected, r.Forge.Name, "expected revision cannot be whitespace").WithVerb(VerbProposalReview)
+		}
+		req.ExpectedRevision = trimmedRev
+	}
+	if len(req.Comments) > 0 {
+		cleaned := make([]ReviewLineComment, len(req.Comments))
+		for i, c := range req.Comments {
+			p := strings.TrimSpace(c.Path)
+			if p == "" {
+				return ProposalReview{}, Errorf(CodeForgeRejected, r.Forge.Name, "review line comment %d path is empty", i).WithVerb(VerbProposalReview)
+			}
+			if c.Line <= 0 {
+				return ProposalReview{}, Errorf(CodeForgeRejected, r.Forge.Name, "review line comment %d line %d must be positive", i, c.Line).WithVerb(VerbProposalReview)
+			}
+			b := strings.TrimSpace(c.Body)
+			if b == "" {
+				return ProposalReview{}, Errorf(CodeForgeRejected, r.Forge.Name, "review line comment %d body is empty", i).WithVerb(VerbProposalReview)
+			}
+			cleaned[i] = ReviewLineComment{Path: p, Line: c.Line, Body: b}
+		}
+		req.Comments = cleaned
+	}
+	req.Body = strings.TrimSpace(req.Body)
+	if (req.Decision == ReviewRequestChanges || req.Decision == ReviewComment) && req.Body == "" && len(req.Comments) == 0 {
+		return ProposalReview{}, Errorf(CodeForgeRejected, r.Forge.Name, "%s review requires a non-empty body or at least one line comment", req.Decision).WithVerb(VerbProposalReview)
+	}
+	out, err := reviewer.ReviewProposal(ctx, r, number, req)
+	return out, r.wrap(VerbProposalReview, err)
+}
+
+// MergeProposal merges an open proposal into its target branch, verifying
+// req.ExpectedRevision against the proposal's head SHA.
+func (r Repo) MergeProposal(ctx context.Context, number int, req ProposalMergeRequest) (ProposalMergeResult, error) {
+	caps, err := r.gate(VerbProposalMerge, false)
+	if err != nil {
+		return ProposalMergeResult{}, err
+	}
+	merger, ok := r.provider.(ProposalMerger)
+	if !ok {
+		return ProposalMergeResult{}, Errorf(CodeForgeUnsupported, r.Forge.Name, "forge %q (%s) does not support %s (proposalNoun: %s)", r.Forge.Name, r.provider.Name(), VerbProposalMerge, caps.ProposalNoun).WithVerb(VerbProposalMerge)
+	}
+	if err := checkNumber(r.Forge.Name, VerbProposalMerge, number); err != nil {
+		return ProposalMergeResult{}, err
+	}
+	req.ExpectedRevision = strings.TrimSpace(req.ExpectedRevision)
+	if req.ExpectedRevision == "" {
+		return ProposalMergeResult{}, Errorf(CodeForgeRejected, r.Forge.Name, "expected revision is required to merge a proposal").WithVerb(VerbProposalMerge)
+	}
+	switch req.Method {
+	case MergeDefault, MergeCreateCommit, MergeSquash, MergeRebase:
+	default:
+		return ProposalMergeResult{}, Errorf(CodeForgeRejected, r.Forge.Name, "merge method %q must be empty, %q, %q, or %q", req.Method, MergeCreateCommit, MergeSquash, MergeRebase).WithVerb(VerbProposalMerge)
+	}
+	req.CommitTitle = strings.TrimSpace(req.CommitTitle)
+	req.CommitMessage = strings.TrimSpace(req.CommitMessage)
+	out, err := merger.MergeProposal(ctx, r, number, req)
+	return out, r.wrap(VerbProposalMerge, err)
 }
 
 func (r Repo) ready(v Verb) error {

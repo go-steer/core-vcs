@@ -169,6 +169,36 @@ func induceMap(fx *fixture, forge vcs.Forge, ctor vcs.Constructor, isPublic bool
 			_, err := repo.CommentProposal(context.Background(), 1, "note")
 			return err
 		},
+		vcs.CodeProposalHeadMoved: func(t *testing.T, repo vcs.Repo) error {
+			fx.forceNext(http.StatusConflict, map[string]any{
+				"message": "SHA does not match HEAD of source branch: fedcba9876543210fedcba9876543210fedcba98",
+			}, nil)
+			_, err := repo.MergeProposal(context.Background(), 1, vcs.ProposalMergeRequest{
+				ExpectedRevision: "0123456789abcdef0123456789abcdef01234567",
+			})
+			if !strings.Contains(err.Error(), "SHA does not match HEAD") {
+				t.Errorf("409 Detail = %q, want verbatim SHA mismatch message", err.Error())
+			}
+			return err
+		},
+		vcs.CodeProtectedBranch: func(t *testing.T, repo vcs.Repo) error {
+			openMR, err := repo.CreateProposal(context.Background(), vcs.ProposalRequest{
+				Source: "agent/unapproved",
+				Title:  "fix: requires approval",
+			})
+			if err != nil {
+				t.Fatalf("CreateProposal: %v", err)
+			}
+			fx.setRequireApproval(true)
+			defer fx.setRequireApproval(false)
+			_, err = repo.MergeProposal(context.Background(), openMR.Number, vcs.ProposalMergeRequest{
+				ExpectedRevision: openMR.Revision,
+			})
+			if !strings.Contains(err.Error(), "405 Method Not Allowed") || !strings.Contains(err.Error(), "detailed_merge_status=not_approved") {
+				t.Errorf("405 Detail = %q, want generic 405 body and detailed_merge_status=not_approved", err.Error())
+			}
+			return err
+		},
 	}
 	if !isPublic {
 		m[vcs.CodeForgeTLSUntrusted] = func(t *testing.T, _ vcs.Repo) error {
@@ -306,6 +336,328 @@ func TestProtectedBranchesDraftLabelsAndNotes(t *testing.T) {
 	}
 	if cms.Comments[1].Kind != vcs.CommentDiscussion {
 		t.Errorf("Comments[1] = %+v, want discussion comment", cms.Comments[1])
+	}
+}
+
+func TestReviewAndMergeProposalGitLab(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fx := newTLSFixture(t)
+	fx.setRequireApproval(true)
+	host, port := serverHostPort(t, fx.Server.URL)
+
+	reg := vcs.NewRegistry()
+	reg.MustRegister(gitlab.Name, gitlab.New)
+	forge := vcs.Forge{
+		Name:     "gl-review",
+		Provider: gitlab.Name,
+		Host:     host,
+		Scheme:   "https",
+		Port:     port,
+		CAFile:   fx.CAFile,
+		Cred:     vcs.StaticToken(validFixtureToken),
+	}
+	cat, err := vcs.NewCatalog(reg, []vcs.Forge{forge}, []vcs.RepoConfig{{
+		Forge:      "gl-review",
+		Repository: "acme/platform/deep/infra",
+		Role:       vcs.RoleGitOps,
+	}})
+	if err != nil {
+		t.Fatalf("NewCatalog: %v", err)
+	}
+	repo, err := cat.Resolve("acme/platform/deep/infra")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	prop, err := repo.CreateProposal(ctx, vcs.ProposalRequest{
+		Source: "agent/fix-limits",
+		Target: "main",
+		Title:  "feat: raise memory limit",
+		Body:   "avoids OOMKill",
+		Draft:  true,
+	})
+	if err != nil {
+		t.Fatalf("CreateProposal: %v", err)
+	}
+	initialSHA := prop.Revision
+
+	// 1. MergeRebase is refused with FORGE_UNSUPPORTED before any network call.
+	fx.forceNext(http.StatusInternalServerError, map[string]any{"message": "must not reach network"}, nil)
+	_, err = repo.MergeProposal(ctx, prop.Number, vcs.ProposalMergeRequest{
+		ExpectedRevision: initialSHA,
+		Method:           vcs.MergeRebase,
+	})
+	vcstest.RequireError(t, err, vcs.CodeForgeUnsupported, "gl-review")
+	if !fx.hasPendingForced() {
+		t.Fatal("MergeRebase guard failed to stop before network: forced 500 was consumed")
+	}
+	fx.clearForced()
+
+	// 2. Draft MR refusal: real GitLab PUT /merge returns generic "405 Method Not Allowed",
+	// and GET /merge_requests/{iid} reports detailed_merge_status="draft_status" -> FORGE_REJECTED.
+	_, err = repo.MergeProposal(ctx, prop.Number, vcs.ProposalMergeRequest{
+		ExpectedRevision: initialSHA,
+		Method:           vcs.MergeSquash,
+	})
+	vcstest.RequireError(t, err, vcs.CodeForgeRejected, "gl-review")
+	if !strings.Contains(err.Error(), "405 Method Not Allowed") || !strings.Contains(err.Error(), "detailed_merge_status=draft_status") {
+		t.Errorf("draft merge refusal = %q, want generic 405 body and detailed_merge_status=draft_status", err.Error())
+	}
+
+	// Mark ready for review.
+	draft := false
+	if _, err := repo.UpdateProposal(ctx, prop.Number, vcs.ProposalUpdate{Draft: &draft}); err != nil {
+		t.Fatalf("UpdateProposal(Draft=false): %v", err)
+	}
+
+	// 3. Policy/check detailed_merge_status values behind generic 405 responses map to PROTECTED_BRANCH;
+	// structural/conflict values map to FORGE_REJECTED.
+	_, err = repo.MergeProposal(ctx, prop.Number, vcs.ProposalMergeRequest{
+		ExpectedRevision: initialSHA,
+	})
+	vcstest.RequireError(t, err, vcs.CodeProtectedBranch, "gl-review")
+	if !strings.Contains(err.Error(), "405 Method Not Allowed") || !strings.Contains(err.Error(), "detailed_merge_status=not_approved") {
+		t.Errorf("not_approved refusal = %q, want generic 405 body and detailed_merge_status=not_approved", err.Error())
+	}
+
+	for _, dms := range []string{
+		"requested_changes",
+		"ci_must_pass",
+		"ci_still_running",
+		"discussions_not_resolved",
+		"external_status_checks",
+		"blocked_status",
+		"security_policy_violations",
+	} {
+		fx.setMRDetailedMergeStatus(prop.Number, dms)
+		_, err = repo.MergeProposal(ctx, prop.Number, vcs.ProposalMergeRequest{
+			ExpectedRevision: initialSHA,
+		})
+		vcstest.RequireError(t, err, vcs.CodeProtectedBranch, "gl-review")
+		if !strings.Contains(err.Error(), "detailed_merge_status="+dms) {
+			t.Errorf("%s Detail = %q, want detailed_merge_status=%s", dms, err.Error(), dms)
+		}
+	}
+
+	for _, tc := range []struct {
+		dms        string
+		wantSubstr string
+	}{
+		{dms: "conflict", wantSubstr: "Branch cannot be merged"},
+		{dms: "need_rebase", wantSubstr: "405 Method Not Allowed"},
+		{dms: "broken_status", wantSubstr: "405 Method Not Allowed"},
+	} {
+		fx.setMRDetailedMergeStatus(prop.Number, tc.dms)
+		_, err = repo.MergeProposal(ctx, prop.Number, vcs.ProposalMergeRequest{
+			ExpectedRevision: initialSHA,
+		})
+		vcstest.RequireError(t, err, vcs.CodeForgeRejected, "gl-review")
+		if !strings.Contains(err.Error(), tc.wantSubstr) || !strings.Contains(err.Error(), "detailed_merge_status="+tc.dms) {
+			t.Errorf("%s Detail = %q, want %q and detailed_merge_status=%s", tc.dms, err.Error(), tc.wantSubstr, tc.dms)
+		}
+	}
+	fx.setMRDetailedMergeStatus(prop.Number, "")
+
+	// 4. Missing diff_refs when inline Comments are requested returns FORGE_REJECTED
+	// without approving the MR.
+	fx.setMRHideDiffRefs(prop.Number, true)
+	_, err = repo.ReviewProposal(ctx, prop.Number, vcs.ProposalReviewRequest{
+		Decision:         vcs.ReviewApprove,
+		ExpectedRevision: initialSHA,
+		Comments: []vcs.ReviewLineComment{{
+			Path: "charts/values.yaml",
+			Line: 12,
+			Body: "bump memory limit",
+		}},
+	})
+	vcstest.RequireError(t, err, vcs.CodeForgeRejected, "gl-review")
+	if fx.snapshotMR(prop.Number).Approved {
+		t.Fatal("MR became approved despite missing diff_refs failure")
+	}
+	fx.setMRHideDiffRefs(prop.Number, false)
+
+	// 5. Validation error on inline /discussions must abort BEFORE /approve is called.
+	fx.forceNextOnSuffix("/discussions", http.StatusBadRequest, map[string]any{
+		"message": "line_code is out of diff range",
+	})
+	_, err = repo.ReviewProposal(ctx, prop.Number, vcs.ProposalReviewRequest{
+		Decision:         vcs.ReviewApprove,
+		ExpectedRevision: initialSHA,
+		Comments: []vcs.ReviewLineComment{{
+			Path: "charts/values.yaml",
+			Line: 999,
+			Body: "bad line",
+		}},
+	})
+	vcstest.RequireError(t, err, vcs.CodeForgeRejected, "gl-review")
+	if fx.snapshotMR(prop.Number).Approved {
+		t.Fatal("MR became approved despite /discussions failure")
+	}
+
+	// 6. diff_refs.head_sha mismatch returns PROPOSAL_HEAD_MOVED.
+	fx.setMRHeads(prop.Number, initialSHA, "2222222222222222222222222222222222222222")
+	_, err = repo.ReviewProposal(ctx, prop.Number, vcs.ProposalReviewRequest{
+		Decision:         vcs.ReviewApprove,
+		ExpectedRevision: initialSHA,
+	})
+	vcstest.RequireError(t, err, vcs.CodeProposalHeadMoved, "gl-review")
+	fx.setMRHeads(prop.Number, initialSHA, initialSHA)
+
+	// 7. Concurrent 409 on POST /approve maps to PROPOSAL_HEAD_MOVED.
+	fx.forceNextOnSuffix("/approve", http.StatusConflict, map[string]any{
+		"message": "SHA does not match HEAD of source branch",
+	})
+	_, err = repo.ReviewProposal(ctx, prop.Number, vcs.ProposalReviewRequest{
+		Decision:         vcs.ReviewApprove,
+		ExpectedRevision: initialSHA,
+	})
+	vcstest.RequireError(t, err, vcs.CodeProposalHeadMoved, "gl-review")
+
+	// 7a. Concurrent push arriving during non-approve review submission (/notes
+	// or /discussions) is caught by the post-submit head re-check and returns
+	// PROPOSAL_HEAD_MOVED.
+	concurrentSHA := "3333333333333333333333333333333333333333"
+	fx.advanceMRHeadOnNextNotePost(prop.Number, concurrentSHA)
+	_, err = repo.ReviewProposal(ctx, prop.Number, vcs.ProposalReviewRequest{
+		Decision:         vcs.ReviewComment,
+		Body:             "race check on summary note",
+		ExpectedRevision: initialSHA,
+	})
+	vcstest.RequireError(t, err, vcs.CodeProposalHeadMoved, "gl-review")
+	if !strings.Contains(err.Error(), concurrentSHA) {
+		t.Errorf("concurrent push Detail = %q, want new head %s", err.Error(), concurrentSHA)
+	}
+	fx.setMRHeads(prop.Number, initialSHA, initialSHA)
+
+	fx.advanceMRHeadOnNextNotePost(prop.Number, concurrentSHA)
+	_, err = repo.ReviewProposal(ctx, prop.Number, vcs.ProposalReviewRequest{
+		Decision:         vcs.ReviewRequestChanges,
+		ExpectedRevision: initialSHA,
+		Comments: []vcs.ReviewLineComment{{
+			Path: "charts/values.yaml",
+			Line: 10,
+			Body: "race check on inline discussion",
+		}},
+	})
+	vcstest.RequireError(t, err, vcs.CodeProposalHeadMoved, "gl-review")
+	fx.setMRHeads(prop.Number, initialSHA, initialSHA)
+
+	// 8. Inline-only ReviewComment (no summary Body) anchors on diff_refs and populates ProposalReview.
+	inlineRv, err := repo.ReviewProposal(ctx, prop.Number, vcs.ProposalReviewRequest{
+		Decision: vcs.ReviewComment,
+		Comments: []vcs.ReviewLineComment{{
+			Path: "charts/values.yaml",
+			Line: 14,
+			Body: "confirm memory request <= limit",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("ReviewProposal(inline-only comment): %v", err)
+	}
+	if inlineRv.ID == "" || inlineRv.Decision != vcs.ReviewComment || inlineRv.Revision != initialSHA || !inlineRv.Author.Bot || inlineRv.Author.Login != "reviewer-agent" {
+		t.Errorf("ReviewProposal(inline-only) = %+v", inlineRv)
+	}
+
+	// 9. POST /approve 401 when user_can_approve=false (e.g. author self-approval)
+	// maps to FORGE_REJECTED with the reason, NOT FORGE_UNAUTHORIZED.
+	fx.setMRCannotApprove(prop.Number, true)
+	_, err = repo.ReviewProposal(ctx, prop.Number, vcs.ProposalReviewRequest{
+		Decision:         vcs.ReviewApprove,
+		ExpectedRevision: initialSHA,
+	})
+	vcstest.RequireError(t, err, vcs.CodeForgeRejected, "gl-review")
+	if !strings.Contains(err.Error(), "user_can_approve=false") {
+		t.Errorf("self-approval refusal Detail = %q, want user_can_approve=false", err.Error())
+	}
+	fx.setMRCannotApprove(prop.Number, false)
+
+	// 10. Silent ReviewApprove records approval; repeating ReviewApprove when
+	// already approved (fixture returns 401 on /approve, user_has_approved=true
+	// on /approvals) succeeds idempotently.
+	approveRv, err := repo.ReviewProposal(ctx, prop.Number, vcs.ProposalReviewRequest{
+		Decision:         vcs.ReviewApprove,
+		ExpectedRevision: initialSHA,
+	})
+	if err != nil {
+		t.Fatalf("ReviewProposal(silent approve): %v", err)
+	}
+	if approveRv.ID == "" || approveRv.Decision != vcs.ReviewApprove || approveRv.Revision != initialSHA || approveRv.URL == "" || approveRv.SubmittedAt.IsZero() {
+		t.Errorf("ReviewProposal(silent approve) = %+v", approveRv)
+	}
+	repeatApproveRv, err := repo.ReviewProposal(ctx, prop.Number, vcs.ProposalReviewRequest{
+		Decision:         vcs.ReviewApprove,
+		ExpectedRevision: initialSHA,
+	})
+	if err != nil {
+		t.Fatalf("ReviewProposal(idempotent repeat approve): %v", err)
+	}
+	if repeatApproveRv.Decision != vcs.ReviewApprove || repeatApproveRv.Revision != initialSHA {
+		t.Errorf("ReviewProposal(idempotent repeat approve) = %+v", repeatApproveRv)
+	}
+
+	// 11. ReviewRequestChanges after a prior approval revokes that approval via
+	// POST /unapprove so the MR is no longer approved/mergeable; repeating
+	// ReviewRequestChanges when already unapproved tolerates 404 Not found.
+	reqChangesRv, err := repo.ReviewProposal(ctx, prop.Number, vcs.ProposalReviewRequest{
+		Decision:         vcs.ReviewRequestChanges,
+		Body:             "hold: verify node memory allocatable first",
+		ExpectedRevision: initialSHA,
+	})
+	if err != nil {
+		t.Fatalf("ReviewProposal(request_changes after approve): %v", err)
+	}
+	if reqChangesRv.Decision != vcs.ReviewRequestChanges {
+		t.Errorf("ReviewProposal(request_changes) Decision = %q", reqChangesRv.Decision)
+	}
+	if fx.snapshotMR(prop.Number).Approved {
+		t.Fatal("MR stayed approved after ReviewRequestChanges")
+	}
+	_, err = repo.MergeProposal(ctx, prop.Number, vcs.ProposalMergeRequest{
+		ExpectedRevision: initialSHA,
+	})
+	vcstest.RequireError(t, err, vcs.CodeProtectedBranch, "gl-review")
+
+	if _, err := repo.ReviewProposal(ctx, prop.Number, vcs.ProposalReviewRequest{
+		Decision:         vcs.ReviewRequestChanges,
+		Body:             "still waiting on node sizing confirmation",
+		ExpectedRevision: initialSHA,
+	}); err != nil {
+		t.Fatalf("ReviewProposal(request_changes when already unapproved): %v", err)
+	}
+
+	// Re-approve before merging.
+	if _, err := repo.ReviewProposal(ctx, prop.Number, vcs.ProposalReviewRequest{
+		Decision:         vcs.ReviewApprove,
+		Body:             "node sizing confirmed, lgtm",
+		ExpectedRevision: initialSHA,
+	}); err != nil {
+		t.Fatalf("ReviewProposal(re-approve): %v", err)
+	}
+
+	// 12. MergeProposal with squash, custom commit title/message, and DeleteSourceBranch=true.
+	merged, err := repo.MergeProposal(ctx, prop.Number, vcs.ProposalMergeRequest{
+		ExpectedRevision:   initialSHA,
+		Method:             vcs.MergeSquash,
+		CommitTitle:        "feat: raise memory limit (!1)",
+		CommitMessage:      "Approved by reviewer-agent.",
+		DeleteSourceBranch: true,
+	})
+	if err != nil {
+		t.Fatalf("MergeProposal: %v", err)
+	}
+	if !merged.Merged || merged.Method != vcs.MergeSquash || merged.Revision != "aaaa111122223333444455556666777788889999" || merged.Proposal.State != vcs.ProposalMerged {
+		t.Errorf("MergeProposal = %+v", merged)
+	}
+	snap := fx.snapshotMR(prop.Number)
+	if snap.LastSquash == nil || !*snap.LastSquash {
+		t.Errorf("LastSquash = %v, want true", snap.LastSquash)
+	}
+	if snap.LastSquashCommitMessage != "feat: raise memory limit (!1)\n\nApproved by reviewer-agent." {
+		t.Errorf("LastSquashCommitMessage = %q", snap.LastSquashCommitMessage)
+	}
+	if !snap.RemovedSourceBranch {
+		t.Error("RemovedSourceBranch = false, want true")
 	}
 }
 

@@ -35,7 +35,7 @@ if vcs.CodeOf(err).Retryable() {
 | `BASE_MOVED` | `CodeBaseMoved` | No | Remote target branch was deleted or force-rewritten since `Clone` so `ClonedRevision()` is no longer an ancestor. Clone again and replay changes. |
 | `BRANCH_DIVERGED` | `CodeBranchDiverged` | No | On first `Publish`, the topic branch already exists on the remote with history not published by this `Workspace`. Pick a new branch name. |
 | `BRANCH_MOVED` | `CodeBranchMoved` | No | On a subsequent `Publish`, the remote tip of the topic branch no longer equals our `lastPublished` hash. Someone else pushed to the branch; clone again. |
-| `PROTECTED_BRANCH` | `CodeProtectedBranch` | No | The forge marks the branch protected against push. Publish to an unprotected topic branch. |
+| `PROTECTED_BRANCH` | `CodeProtectedBranch` | No | The forge marks the branch protected against push, or branch protection / required reviews / status checks / repository rules block `MergeProposal`. |
 | `BASE_BRANCH_MISSING` | `CodeBaseBranchMissing` | No | The configured or default base branch does not exist on the remote repository. |
 | `CLONE_TOO_LARGE` | `CodeCloneTooLarge` | No | Checked-out working tree exceeds `Policy.MaxCloneBytes`; the directory was removed. |
 | `NOTHING_TO_COMMIT` | `CodeNothingToCommit` | No | `Workspace.Commit` was called on a clean working tree or an empty index. |
@@ -45,6 +45,7 @@ if vcs.CodeOf(err).Retryable() {
 
 | Code | Constant | Retryable | Meaning & recovery action |
 |---|---|---|---|
+| `PROPOSAL_HEAD_MOVED` | `CodeProposalHeadMoved` | No | Remote proposal head no longer matches `ExpectedRevision` on `ReviewProposal` or `MergeProposal`. Re-read the proposal and diff before reviewing or merging. |
 | `FORGE_UNAUTHORIZED` | `CodeForgeUnauthorized` | No | HTTP 401, unthrottled HTTP 403, or empty/failed credential resolution. Stop and report the credential failure. |
 | `FORGE_UNAVAILABLE` | `CodeForgeUnavailable` | **Yes** | HTTP 5xx, HTTP 429, rate-limited HTTP 403 (`Retry-After` / `X-RateLimit-Remaining: 0`), or network timeout/connection reset. Retry with backoff. |
 | `FORGE_REJECTED` | `CodeForgeRejected` | No | HTTP 400 / 404 / 409 / 422 or non-fast-forward push rejection. Fix the request parameters or commit message. |

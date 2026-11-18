@@ -135,6 +135,27 @@ func induceAll(fx *fakeprovider.Fixture) map[vcs.Code]func(t *testing.T, repo vc
 			_, err := repo.BaseBranchName(ctx)
 			return err
 		},
+		vcs.CodeProposalHeadMoved: func(t *testing.T, repo vcs.Repo) error {
+			p, err := repo.CreateProposal(ctx, vcs.ProposalRequest{Source: "agent/head-moved", Title: "t"})
+			if err != nil {
+				t.Fatalf("CreateProposal: %v", err)
+			}
+			_, err = repo.MergeProposal(ctx, p.Number, vcs.ProposalMergeRequest{
+				ExpectedRevision: "0000000000000000000000000000000000000000",
+			})
+			return err
+		},
+		vcs.CodeProtectedBranch: func(t *testing.T, repo vcs.Repo) error {
+			p, err := repo.CreateProposal(ctx, vcs.ProposalRequest{Source: "agent/protected-merge", Title: "t"})
+			if err != nil {
+				t.Fatalf("CreateProposal: %v", err)
+			}
+			fx.ForceNext(http.StatusMethodNotAllowed, "At least 1 approving review is required on protected branch", nil)
+			_, err = repo.MergeProposal(ctx, p.Number, vcs.ProposalMergeRequest{
+				ExpectedRevision: p.Revision,
+			})
+			return err
+		},
 	}
 }
 
