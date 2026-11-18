@@ -77,6 +77,10 @@ const (
 
 	// Forge calls.
 
+	// CodeProposalHeadMoved: remote proposal head no longer matches
+	// ExpectedRevision; re-read the proposal and diff before reviewing or
+	// merging.
+	CodeProposalHeadMoved Code = "PROPOSAL_HEAD_MOVED"
 	// CodeForgeUnauthorized is a credential the forge refused (401, or 403
 	// without rate-limit headers); stop, no retry helps.
 	CodeForgeUnauthorized Code = "FORGE_UNAUTHORIZED"
@@ -103,6 +107,7 @@ var Codes = []Code{
 	CodeConfigInvalid, CodeRepoInvalid, CodeRepoUnknown, CodeForgeUnsupported, CodeRoleVCSVerbs,
 	CodeTargetIsBranch, CodeBranchNotOurs, CodeBaseMoved, CodeBranchMoved, CodeBranchDiverged,
 	CodeProtectedBranch, CodeBaseBranchMissing, CodeCloneTooLarge, CodeNothingToCommit, CodeGitFailed,
+	CodeProposalHeadMoved,
 	CodeForgeUnauthorized, CodeForgeUnavailable, CodeForgeRejected, CodeForgeCallFailed,
 	CodeForgeTLSUntrusted, CodeForgeIdentityUnknown, CodeLabelsUnsupported,
 }

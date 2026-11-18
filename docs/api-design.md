@@ -261,6 +261,8 @@ func (r Repo) ProposalCommits(ctx context.Context, number int, p Page) (CommitLi
 func (r Repo) CommentProposal(ctx context.Context, number int, body string) (Comment, error)
 func (r Repo) UpdateProposal(ctx context.Context, number int, u ProposalUpdate) (Proposal, error)
 func (r Repo) CloseProposal(ctx context.Context, number int) (Proposal, error)
+func (r Repo) ReviewProposal(ctx context.Context, number int, req ProposalReviewRequest) (ProposalReview, error)
+func (r Repo) MergeProposal(ctx context.Context, number int, req ProposalMergeRequest) (ProposalMergeResult, error)
 
 // ---- Provider: the SPI one package per forge implements ----------------
 
@@ -286,6 +288,15 @@ type Provider interface {
 	CloseProposal(ctx context.Context, repo Repo, number int) (Proposal, error)
 }
 
+// Optional v1.x SPI extensions (#20); Provider stays frozen at v1.0.0.
+type ProposalReviewer interface {
+	ReviewProposal(ctx context.Context, repo Repo, number int, req ProposalReviewRequest) (ProposalReview, error)
+}
+
+type ProposalMerger interface {
+	MergeProposal(ctx context.Context, repo Repo, number int, req ProposalMergeRequest) (ProposalMergeResult, error)
+}
+
 type BasicAuth struct{ Username, Password string } // Password redacts under %v
 
 // Transport helpers every provider and the Workspace use (decision 8).
@@ -298,13 +309,14 @@ func TransportError(f Forge, verb Verb, err error) *Error
 type Verb string
 
 const (
-	VerbClone, VerbCommit, VerbPublish                              Verb = "clone", "commit", "publish"
-	VerbProposalCreate, VerbProposalList, VerbProposalView           Verb = "proposal-create", "proposal-list", "proposal-view"
-	VerbProposalComments, VerbProposalComment, VerbProposalUpdate    Verb = "proposal-comments", "proposal-comment", "proposal-update"
-	VerbProposalClose, VerbProposalCommits                           Verb = "proposal-close", "proposal-commits"
+	VerbClone, VerbCommit, VerbPublish                           Verb = "clone", "commit", "publish"
+	VerbProposalCreate, VerbProposalList, VerbProposalView       Verb = "proposal-create", "proposal-list", "proposal-view"
+	VerbProposalComments, VerbProposalComment, VerbProposalUpdate Verb = "proposal-comments", "proposal-comment", "proposal-update"
+	VerbProposalClose, VerbProposalCommits                       Verb = "proposal-close", "proposal-commits"
+	VerbProposalReview, VerbProposalMerge                        Verb = "proposal-review", "proposal-merge"
 )
 
-func (v Verb) Mutating() bool // commit, publish, proposal-create/-comment/-update/-close
+func (v Verb) Mutating() bool // commit, publish, proposal-create/-comment/-update/-close/-review/-merge
 
 // ProposalNoun values the core defines; a forge supplies its own otherwise.
 const (
@@ -422,6 +434,61 @@ type CommitList struct {
 	Truncated bool
 }
 
+type ReviewDecision string
+
+const (
+	ReviewApprove        ReviewDecision = "approve"
+	ReviewRequestChanges ReviewDecision = "request_changes"
+	ReviewComment        ReviewDecision = "comment"
+)
+
+type ReviewLineComment struct {
+	Path string
+	Line int
+	Body string
+}
+
+type ProposalReviewRequest struct {
+	Decision         ReviewDecision      // required: approve | request_changes | comment
+	Body             string              // required for request_changes and comment when Comments is empty
+	ExpectedRevision string              // optional; when set, refuses PROPOSAL_HEAD_MOVED if remote tip moved
+	Comments         []ReviewLineComment // optional inline diff comments
+}
+
+type ProposalReview struct {
+	ID          string
+	Decision    ReviewDecision
+	Author      Actor
+	Body        string
+	Revision    string
+	URL         string
+	SubmittedAt time.Time
+}
+
+type MergeMethod string
+
+const (
+	MergeDefault      MergeMethod = "" // forge default
+	MergeCreateCommit MergeMethod = "merge"
+	MergeSquash       MergeMethod = "squash"
+	MergeRebase       MergeMethod = "rebase"
+)
+
+type ProposalMergeRequest struct {
+	ExpectedRevision   string      // required; compared atomically against the proposal's head SHA
+	Method             MergeMethod // "" uses the repository's default on the forge
+	CommitTitle        string      // optional custom merge/squash commit title
+	CommitMessage      string      // optional custom merge/squash commit body
+	DeleteSourceBranch bool        // best-effort source branch cleanup when supported
+}
+
+type ProposalMergeResult struct {
+	Merged   bool
+	Revision string // resulting target-branch merge/squash commit SHA when reported by the forge
+	Method   MergeMethod
+	Proposal Proposal
+}
+
 // ---- errors -------------------------------------------------------------
 
 type Code string
@@ -447,6 +514,7 @@ const (
 	CodeGitFailed         Code = "GIT_FAILED"         // go-git failure the workspace could not classify
 
 	// Forge calls.
+	CodeProposalHeadMoved    Code = "PROPOSAL_HEAD_MOVED"    // proposal head moved from ExpectedRevision; re-read diff
 	CodeForgeUnauthorized    Code = "FORGE_UNAUTHORIZED"    // 401 / unthrottled 403; the credential was refused, stop
 	CodeForgeUnavailable     Code = "FORGE_UNAVAILABLE"     // 5xx / throttled; retry the same call later
 	CodeForgeRejected        Code = "FORGE_REJECTED"        // the forge refused the request; fix it, do not repeat
@@ -657,3 +725,72 @@ Settled 2026-11-04 in review; recorded as decisions 13–15.
     `advance` and no `TARGET_NOT_BASE`: a second publish is a publish whose
     `lastPublished` is set and is checked by `BRANCH_MOVED`. Issue #3's
     `Publish(ctx, branch, target, opts)` is superseded by this.
+
+## Amendment: `proposal-review` and `proposal-merge` (#20)
+
+**TL;DR:** [core-vcs#20](https://github.com/go-steer/core-vcs/issues/20)
+amends the `gitops-vcs-design.md` out-of-scope entry ("no `proposal-merge`
+verb") by adding `proposal-review` and `proposal-merge` on optional `v1.x`
+SPI interfaces (`ProposalReviewer`, `ProposalMerger`), gated by mandatory
+`ExpectedRevision` optimistic concurrency so a distinct distroless reviewer
+agent (with its own credential) can review, approve, and merge an author
+agent's proposal without weakening branch protection or `TARGET_IS_BRANCH`.
+
+### Why both verbs exist
+
+Single-identity writer flows still never merge their own proposals: giving one
+bot both `proposal-create` and `proposal-merge` collapses `TARGET_IS_BRANCH`
+into a two-step write to `main`. Two-identity loops run two separate
+credentials in distroless containers (no `git`, `gh`, or `bash`):
+
+1. **Writer identity**: clones, commits, publishes an `agent/*` branch, and
+   opens a proposal.
+2. **Reviewer identity** (distinct GitHub App / GitLab bot or per-caller
+   human-delegated credential): inspects the proposal diff and CI status,
+   records a structured review (`approve`, `request_changes`, or `comment`),
+   and merges proposals that pass policy.
+
+On repositories with branch protection (`1+ approving review`, no
+self-approval), `proposal-merge` fails (`405 Method Not Allowed`) unless the
+reviewer identity first records an approving review via `proposal-review`.
+
+### Settled amendment decisions (16–18)
+
+16. **Optional SPI extension interfaces preserve `v1.0.0` `apidiff`
+    compatibility.** `Provider` is frozen under `dev/api-surface.txt`.
+    `ProposalReviewer` and `ProposalMerger` are optional extension interfaces
+    in `package vcs`. `Repo.ReviewProposal` and `Repo.MergeProposal` run
+    `r.gate(...)` and type-assert `r.provider`; `Repo.Capabilities` filters
+    `proposal-review` and `proposal-merge` into `Capabilities.Missing`
+    whenever `r.provider` does not implement the corresponding interface, so
+    `providers/git` and third-party `v1.0` providers return
+    `FORGE_UNSUPPORTED` before any network call.
+
+17. **Mandatory `ExpectedRevision` stops TOCTOU / bait-and-switch merges.**
+    `ProposalMergeRequest.ExpectedRevision` is required (`FORGE_REJECTED`
+    before network when empty or whitespace) and passed to the forge's atomic
+    head-SHA compare-and-set (`sha` on GitHub and GitLab). If a writer pushes a
+    new commit after the reviewer read the diff, the forge rejects with `409`
+    and the provider returns `CodeProposalHeadMoved` (`PROPOSAL_HEAD_MOVED`,
+    non-retryable). `ProposalReviewRequest.ExpectedRevision` checks the remote
+    proposal head before and after submitting a review (on GitHub, `commit_id`
+    alone only rejects force-pushes because ancestor commits remain in the PR's
+    commit list; if a concurrent non-force push lands during `POST /reviews`,
+    the post-check returns `PROPOSAL_HEAD_MOVED` naming the review ID recorded
+    on the stale revision). Because forge review endpoints have no atomic
+    head-SHA compare-and-set across review creation, `ProposalMergeRequest.ExpectedRevision`
+    is the only atomic commit gate.
+
+18. **Separation of duties stays structural.** `VerbProposalReview` and
+    `VerbProposalMerge` return `Mutating() == true`, so `RoleContext`
+    repositories refuse both with `ROLE_VCS_VERBS`. `Workspace.Publish`
+    retains `TARGET_IS_BRANCH` and `BRANCH_NOT_OURS` unchanged.
+
+### Provider mappings
+
+| Aspect | `providers/github` (`github.com` + GHES `/api/v3`) | `providers/gitlab` (`gitlab.com` + self-managed `/api/v4`) | `providers/git` |
+|---|---|---|---|
+| `proposal-review` | Require non-empty `Body` for `request_changes` / `comment`; pre-check `head.sha` when `ExpectedRevision` is set, `POST /repos/{owner}/{repo}/pulls/{number}/reviews` (`event`, `commit_id`, `body`, `comments[]` with `side: "RIGHT"`), and re-check `head.sha` post-`POST` | Verify `sha` / `diff_refs.head_sha`, post inline comments via `/discussions` (`position`) and summary via `/notes`, then on `approve` call `POST .../approve` (`sha`, disambiguating `401` via `GET .../approvals` for idempotent retries vs `user_can_approve=false` `FORGE_REJECTED`) or on `request_changes` revoke any prior approval via `POST .../unapprove` | `Missing` (`FORGE_UNSUPPORTED`) |
+| `proposal-merge` | `PUT /repos/{owner}/{repo}/pulls/{number}/merge` (`sha: ExpectedRevision`, `merge_method`, `commit_title`, `commit_message`) + best-effort `DELETE /git/refs/heads/{source}` only when `head.repo` is non-null, matches the target repo, and `source` is neither the base branch nor protected | `PUT /projects/{id}/merge_requests/{iid}/merge` (`sha: ExpectedRevision`, `squash`, `merge_commit_message` / `squash_commit_message`, `should_remove_source_branch`; `MergeRebase` returns `FORGE_UNSUPPORTED` before network) | `Missing` (`FORGE_UNSUPPORTED`) |
+| Head drift (`409` / stale SHA) | `PROPOSAL_HEAD_MOVED` | `PROPOSAL_HEAD_MOVED` | — |
+| Blocked by policy vs mergeability | `405` / `422` protection, required-review, required-check, ruleset, or `mergeable_state=blocked` refusal → `PROTECTED_BRANCH`; `405` base-branch-modified race → `FORGE_UNAVAILABLE`; draft, closed, or merge conflict → `FORGE_REJECTED` with verbatim forge message | On generic `405` / `406` / `422`, `GET /projects/{id}/merge_requests/{iid}` inspects `detailed_merge_status`: `not_approved`, `requested_changes`, `ci_must_pass`, `ci_still_running`, `discussions_not_resolved`, `external_status_checks`, `blocked_status`, `security_policy_violations` → `PROTECTED_BRANCH`; `draft_status`, `not_open`, `conflict`, `need_rebase`, `broken_status` → `FORGE_REJECTED` | — |

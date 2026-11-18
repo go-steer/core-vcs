@@ -243,3 +243,93 @@ type CommitList struct {
 	Commits   []Commit
 	Truncated bool
 }
+
+// ProposalReviewer is an optional extension implemented by Providers whose
+// forge supports structured review decisions (approve / request changes).
+type ProposalReviewer interface {
+	ReviewProposal(ctx context.Context, repo Repo, number int, req ProposalReviewRequest) (ProposalReview, error)
+}
+
+// ProposalMerger is an optional extension implemented by Providers whose
+// forge can merge an open proposal into its target branch.
+type ProposalMerger interface {
+	MergeProposal(ctx context.Context, repo Repo, number int, req ProposalMergeRequest) (ProposalMergeResult, error)
+}
+
+// ReviewDecision is the verdict of a ProposalReview.
+type ReviewDecision string
+
+const (
+	// ReviewApprove records an approving review on the proposal.
+	ReviewApprove ReviewDecision = "approve"
+	// ReviewRequestChanges requests revisions before the proposal can merge.
+	ReviewRequestChanges ReviewDecision = "request_changes"
+	// ReviewComment submits review commentary without approving or blocking.
+	ReviewComment ReviewDecision = "comment"
+)
+
+// ReviewLineComment anchors an inline review comment to a 1-based line on the
+// proposal's head revision.
+type ReviewLineComment struct {
+	Path string
+	Line int
+	Body string
+}
+
+// ProposalReviewRequest submits a structured review on a proposal.
+//
+// When ExpectedRevision is non-empty, providers verify the proposal's head SHA
+// around submission and return CodeProposalHeadMoved if the remote tip moved.
+// Because forge review endpoints do not offer an atomic head-SHA compare-and-set
+// against concurrent non-force pushes, a review can still attach to an ancestor
+// commit during a narrow concurrent-push race before the post-check returns
+// CodeProposalHeadMoved; ProposalMergeRequest.ExpectedRevision is the forge's
+// atomic commit gate.
+type ProposalReviewRequest struct {
+	Decision         ReviewDecision      // required: approve | request_changes | comment
+	Body             string              // required for request_changes and comment (when Comments is empty)
+	ExpectedRevision string              // optional; when set, refuses PROPOSAL_HEAD_MOVED if remote tip moved
+	Comments         []ReviewLineComment // optional inline diff comments
+}
+
+// ProposalReview is a structured review recorded on a proposal.
+type ProposalReview struct {
+	ID          string
+	Decision    ReviewDecision
+	Author      Actor
+	Body        string
+	Revision    string
+	URL         string
+	SubmittedAt time.Time
+}
+
+// MergeMethod selects how a forge integrates a proposal into its target branch.
+type MergeMethod string
+
+const (
+	// MergeDefault uses the repository's default merge method on the forge.
+	MergeDefault MergeMethod = ""
+	// MergeCreateCommit records an explicit merge commit.
+	MergeCreateCommit MergeMethod = "merge"
+	// MergeSquash squashes the proposal's commits into one commit on target.
+	MergeSquash MergeMethod = "squash"
+	// MergeRebase rebases or fast-forwards the proposal's commits onto target.
+	MergeRebase MergeMethod = "rebase"
+)
+
+// ProposalMergeRequest merges an open proposal into its target branch.
+type ProposalMergeRequest struct {
+	ExpectedRevision   string      // required; compared atomically against the proposal's head SHA
+	Method             MergeMethod // "" uses the repository's default on the forge
+	CommitTitle        string      // optional custom merge/squash commit title
+	CommitMessage      string      // optional custom merge/squash commit body
+	DeleteSourceBranch bool        // best-effort source branch cleanup when supported
+}
+
+// ProposalMergeResult is the outcome of MergeProposal.
+type ProposalMergeResult struct {
+	Merged   bool
+	Revision string // resulting target-branch merge/squash commit SHA when reported by the forge
+	Method   MergeMethod
+	Proposal Proposal
+}

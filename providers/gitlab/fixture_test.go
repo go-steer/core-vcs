@@ -42,29 +42,45 @@ type fixture struct {
 	mu                sync.Mutex
 	nextForced        *forcedReply
 	defaultBranch     string
+	requireApproval   bool
 	protectedBranches []string
 	mrs               map[int]*mrRecord
 	notes             map[int][]map[string]any
 }
 
 type forcedReply struct {
-	status  int
-	headers map[string]string
-	body    any
+	pathSuffix string
+	status     int
+	headers    map[string]string
+	body       any
 }
 
 type mrRecord struct {
-	IID          int      `json:"iid"`
-	Title        string   `json:"title"`
-	Description  string   `json:"description"`
-	State        string   `json:"state"`
-	Draft        bool     `json:"draft"`
-	SourceBranch string   `json:"source_branch"`
-	TargetBranch string   `json:"target_branch"`
-	SHA          string   `json:"sha"`
-	Labels       []string `json:"labels"`
-	CreatedAt    string   `json:"created_at"`
-	UpdatedAt    string   `json:"updated_at"`
+	IID                     int      `json:"iid"`
+	Title                   string   `json:"title"`
+	Description             string   `json:"description"`
+	State                   string   `json:"state"`
+	Draft                   bool     `json:"draft"`
+	Approved                bool     `json:"-"`
+	CannotApprove           bool     `json:"-"`
+	DetailedMergeStatus     string   `json:"-"`
+	SourceBranch            string   `json:"source_branch"`
+	TargetBranch            string   `json:"target_branch"`
+	SHA                     string   `json:"sha"`
+	AdvanceOnNextNotePost   string   `json:"-"`
+	BaseSHA                 string   `json:"-"`
+	StartSHA                string   `json:"-"`
+	DiffHeadSHA             string   `json:"-"`
+	HideDiffRefs            bool     `json:"-"`
+	MergeCommitSHA          string   `json:"-"`
+	SquashCommitSHA         string   `json:"-"`
+	LastSquash              *bool    `json:"-"`
+	LastMergeCommitMessage  string   `json:"-"`
+	LastSquashCommitMessage string   `json:"-"`
+	RemovedSourceBranch     bool     `json:"-"`
+	Labels                  []string `json:"labels"`
+	CreatedAt               string   `json:"created_at"`
+	UpdatedAt               string   `json:"updated_at"`
 }
 
 func newTLSFixture(tb testing.TB) *fixture {
@@ -114,11 +130,85 @@ func (fx *fixture) forceNext(status int, body any, headers map[string]string) {
 	fx.nextForced = &forcedReply{status: status, headers: headers, body: body}
 }
 
+func (fx *fixture) forceNextOnSuffix(pathSuffix string, status int, body any) {
+	fx.mu.Lock()
+	defer fx.mu.Unlock()
+	fx.nextForced = &forcedReply{pathSuffix: pathSuffix, status: status, body: body}
+}
+
+func (fx *fixture) hasPendingForced() bool {
+	fx.mu.Lock()
+	defer fx.mu.Unlock()
+	return fx.nextForced != nil
+}
+
+func (fx *fixture) clearForced() {
+	fx.mu.Lock()
+	defer fx.mu.Unlock()
+	fx.nextForced = nil
+}
+
+func (fx *fixture) setRequireApproval(req bool) {
+	fx.mu.Lock()
+	defer fx.mu.Unlock()
+	fx.requireApproval = req
+}
+
+func (fx *fixture) setMRDetailedMergeStatus(iid int, dms string) {
+	fx.mu.Lock()
+	defer fx.mu.Unlock()
+	if mr := fx.mrs[iid]; mr != nil {
+		mr.DetailedMergeStatus = dms
+	}
+}
+
+func (fx *fixture) setMRCannotApprove(iid int, blocked bool) {
+	fx.mu.Lock()
+	defer fx.mu.Unlock()
+	if mr := fx.mrs[iid]; mr != nil {
+		mr.CannotApprove = blocked
+	}
+}
+
+func (fx *fixture) setMRHideDiffRefs(iid int, hide bool) {
+	fx.mu.Lock()
+	defer fx.mu.Unlock()
+	if mr := fx.mrs[iid]; mr != nil {
+		mr.HideDiffRefs = hide
+	}
+}
+
+func (fx *fixture) setMRHeads(iid int, sha, diffHeadSHA string) {
+	fx.mu.Lock()
+	defer fx.mu.Unlock()
+	if mr := fx.mrs[iid]; mr != nil {
+		mr.SHA = sha
+		mr.DiffHeadSHA = diffHeadSHA
+	}
+}
+
+func (fx *fixture) advanceMRHeadOnNextNotePost(iid int, newSHA string) {
+	fx.mu.Lock()
+	defer fx.mu.Unlock()
+	if mr := fx.mrs[iid]; mr != nil {
+		mr.AdvanceOnNextNotePost = newSHA
+	}
+}
+
+func (fx *fixture) snapshotMR(iid int) mrRecord {
+	fx.mu.Lock()
+	defer fx.mu.Unlock()
+	if mr := fx.mrs[iid]; mr != nil {
+		return *mr
+	}
+	return mrRecord{}
+}
+
 func (fx *fixture) serve(w http.ResponseWriter, r *http.Request) {
 	fx.mu.Lock()
 	defer fx.mu.Unlock()
 
-	if fx.nextForced != nil {
+	if fx.nextForced != nil && (fx.nextForced.pathSuffix == "" || strings.HasSuffix(r.URL.EscapedPath(), fx.nextForced.pathSuffix)) {
 		rep := fx.nextForced
 		fx.nextForced = nil
 		for k, v := range rep.headers {
@@ -205,6 +295,9 @@ func (fx *fixture) serve(w http.ResponseWriter, r *http.Request) {
 			SourceBranch: in.SourceBranch,
 			TargetBranch: in.TargetBranch,
 			SHA:          "fedcba9876543210fedcba9876543210fedcba98",
+			BaseSHA:      "1111111111111111111111111111111111111111",
+			StartSHA:     "1111111111111111111111111111111111111111",
+			DiffHeadSHA:  "fedcba9876543210fedcba9876543210fedcba98",
 			Labels:       labels,
 			CreatedAt:    "2026-11-04T12:00:00Z",
 			UpdatedAt:    "2026-11-04T12:00:00Z",
@@ -292,10 +385,143 @@ func (fx *fixture) serveMRSubroute(w http.ResponseWriter, r *http.Request, proje
 			"created_at": "2026-11-04T12:02:00Z",
 		}
 		fx.notes[mr.IID] = append(fx.notes[mr.IID], note)
+		if mr.AdvanceOnNextNotePost != "" {
+			mr.SHA = mr.AdvanceOnNextNotePost
+			mr.DiffHeadSHA = mr.AdvanceOnNextNotePost
+			mr.AdvanceOnNextNotePost = ""
+		}
 		writeFixtureJSON(w, http.StatusCreated, note)
 
 	case len(sub) == 1 && sub[0] == "notes" && r.Method == http.MethodGet:
 		writeFixtureJSON(w, http.StatusOK, fx.notes[mr.IID])
+
+	case len(sub) == 1 && sub[0] == "discussions" && r.Method == http.MethodPost:
+		var in struct {
+			Body     string `json:"body"`
+			Position struct {
+				PositionType string `json:"position_type"`
+				BaseSHA      string `json:"base_sha"`
+				StartSHA     string `json:"start_sha"`
+				HeadSHA      string `json:"head_sha"`
+				NewPath      string `json:"new_path"`
+				NewLine      int    `json:"new_line"`
+			} `json:"position"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			writeFixtureJSON(w, http.StatusBadRequest, map[string]any{"message": err.Error()})
+			return
+		}
+		if in.Position.PositionType != "text" ||
+			in.Position.BaseSHA == "" ||
+			in.Position.StartSHA == "" ||
+			in.Position.HeadSHA == "" ||
+			in.Position.NewPath == "" ||
+			in.Position.NewLine <= 0 ||
+			strings.TrimSpace(in.Body) == "" {
+			writeFixtureJSON(w, http.StatusBadRequest, map[string]any{"message": "400 Bad request - invalid diff position"})
+			return
+		}
+		id := len(fx.notes[mr.IID]) + 701
+		note := map[string]any{
+			"id":         id,
+			"body":       in.Body,
+			"system":     false,
+			"author":     map[string]any{"username": "reviewer-agent[bot]", "bot": true},
+			"created_at": "2026-11-04T12:02:30Z",
+			"position": map[string]any{
+				"position_type": in.Position.PositionType,
+				"base_sha":      in.Position.BaseSHA,
+				"start_sha":     in.Position.StartSHA,
+				"head_sha":      in.Position.HeadSHA,
+				"new_path":      in.Position.NewPath,
+				"new_line":      in.Position.NewLine,
+			},
+		}
+		fx.notes[mr.IID] = append(fx.notes[mr.IID], note)
+		if mr.AdvanceOnNextNotePost != "" {
+			mr.SHA = mr.AdvanceOnNextNotePost
+			mr.DiffHeadSHA = mr.AdvanceOnNextNotePost
+			mr.AdvanceOnNextNotePost = ""
+		}
+		writeFixtureJSON(w, http.StatusCreated, map[string]any{
+			"id":    fmt.Sprintf("disc-%d", id),
+			"notes": []map[string]any{note},
+		})
+
+	case len(sub) == 1 && sub[0] == "approve" && r.Method == http.MethodPost:
+		var in struct {
+			SHA string `json:"sha"`
+		}
+		if r.Body != nil {
+			_ = json.NewDecoder(r.Body).Decode(&in)
+		}
+		// Real GitLab POST /approve returns 401 when the caller has already
+		// approved or is barred from approving (e.g. author self-approval).
+		if mr.Approved || mr.CannotApprove {
+			writeFixtureJSON(w, http.StatusUnauthorized, map[string]any{"message": "401 Unauthorized"})
+			return
+		}
+		if in.SHA != "" && in.SHA != mr.SHA {
+			writeFixtureJSON(w, http.StatusConflict, map[string]any{"message": "SHA does not match HEAD of source branch"})
+			return
+		}
+		mr.Approved = true
+		writeFixtureJSON(w, http.StatusCreated, fx.renderApprovals(mr))
+
+	case len(sub) == 1 && sub[0] == "approvals" && r.Method == http.MethodGet:
+		writeFixtureJSON(w, http.StatusOK, fx.renderApprovals(mr))
+
+	case len(sub) == 1 && sub[0] == "unapprove" && r.Method == http.MethodPost:
+		if !mr.Approved {
+			writeFixtureJSON(w, http.StatusNotFound, map[string]any{"message": "404 Not found"})
+			return
+		}
+		mr.Approved = false
+		writeFixtureJSON(w, http.StatusCreated, fx.renderApprovals(mr))
+
+	case len(sub) == 1 && sub[0] == "merge" && r.Method == http.MethodPut:
+		var in struct {
+			SHA                      string `json:"sha"`
+			Squash                   *bool  `json:"squash"`
+			MergeCommitMessage       string `json:"merge_commit_message"`
+			SquashCommitMessage      string `json:"squash_commit_message"`
+			ShouldRemoveSourceBranch bool   `json:"should_remove_source_branch"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			writeFixtureJSON(w, http.StatusBadRequest, map[string]any{"message": err.Error()})
+			return
+		}
+		if mr.State != "opened" {
+			writeFixtureJSON(w, http.StatusMethodNotAllowed, map[string]any{"message": "405 Method Not Allowed"})
+			return
+		}
+		if in.SHA != "" && in.SHA != mr.SHA {
+			writeFixtureJSON(w, http.StatusConflict, map[string]any{"message": "SHA does not match HEAD of source branch: " + mr.SHA})
+			return
+		}
+		switch dms := fx.effectiveDetailedMergeStatus(mr); dms {
+		case "mergeable":
+			// Proceed to merge.
+		case "conflict":
+			writeFixtureJSON(w, http.StatusUnprocessableEntity, map[string]any{"message": "Branch cannot be merged"})
+			return
+		default:
+			// Real GitLab returns a generic 405 body for draft, not_approved,
+			// ci_must_pass, discussions_not_resolved, etc.
+			writeFixtureJSON(w, http.StatusMethodNotAllowed, map[string]any{"message": "405 Method Not Allowed"})
+			return
+		}
+		mr.State = "merged"
+		mr.LastSquash = in.Squash
+		mr.LastMergeCommitMessage = in.MergeCommitMessage
+		mr.LastSquashCommitMessage = in.SquashCommitMessage
+		mr.RemovedSourceBranch = in.ShouldRemoveSourceBranch
+		if in.Squash != nil && *in.Squash {
+			mr.SquashCommitSHA = "aaaa111122223333444455556666777788889999"
+		} else {
+			mr.MergeCommitSHA = "bbbb111122223333444455556666777788889999"
+		}
+		writeFixtureJSON(w, http.StatusOK, fx.renderMR(projectPath, mr))
 
 	case len(sub) == 1 && sub[0] == "commits" && r.Method == http.MethodGet:
 		writeFixtureJSON(w, http.StatusOK, []map[string]any{{
@@ -312,22 +538,80 @@ func (fx *fixture) serveMRSubroute(w http.ResponseWriter, r *http.Request, proje
 	}
 }
 
-func (fx *fixture) renderMR(projectPath string, mr *mrRecord) map[string]any {
-	return map[string]any{
-		"iid":           mr.IID,
-		"web_url":       fmt.Sprintf("https://%s/%s/-/merge_requests/%d", gitlab.PublicHost, projectPath, mr.IID),
-		"title":         mr.Title,
-		"description":   mr.Description,
-		"state":         mr.State,
-		"draft":         mr.Draft,
-		"source_branch": mr.SourceBranch,
-		"target_branch": mr.TargetBranch,
-		"sha":           mr.SHA,
-		"author":        map[string]any{"username": "platform-agent", "bot": true},
-		"labels":        mr.Labels,
-		"created_at":    mr.CreatedAt,
-		"updated_at":    mr.UpdatedAt,
+func (fx *fixture) effectiveDetailedMergeStatus(mr *mrRecord) string {
+	if mr.DetailedMergeStatus != "" {
+		return mr.DetailedMergeStatus
 	}
+	if mr.State != "opened" {
+		return "not_open"
+	}
+	if mr.Draft {
+		return "draft_status"
+	}
+	if fx.requireApproval && !mr.Approved {
+		return "not_approved"
+	}
+	return "mergeable"
+}
+
+func (fx *fixture) renderApprovals(mr *mrRecord) map[string]any {
+	approvedBy := []map[string]any{}
+	if mr.Approved {
+		approvedBy = append(approvedBy, map[string]any{
+			"user": map[string]any{"username": "reviewer-agent[bot]", "bot": true},
+		})
+	}
+	return map[string]any{
+		"id":                mr.IID,
+		"iid":               mr.IID,
+		"sha":               mr.SHA,
+		"approved":          mr.Approved,
+		"user_has_approved": mr.Approved,
+		"user_can_approve":  !mr.Approved && !mr.CannotApprove,
+		"updated_at":        "2026-11-04T12:03:00Z",
+		"approved_by":       approvedBy,
+	}
+}
+
+func (fx *fixture) renderMR(projectPath string, mr *mrRecord) map[string]any {
+	out := map[string]any{
+		"iid":                   mr.IID,
+		"web_url":               fmt.Sprintf("https://%s/%s/-/merge_requests/%d", gitlab.PublicHost, projectPath, mr.IID),
+		"title":                 mr.Title,
+		"description":           mr.Description,
+		"state":                 mr.State,
+		"draft":                 mr.Draft,
+		"detailed_merge_status": fx.effectiveDetailedMergeStatus(mr),
+		"source_branch":         mr.SourceBranch,
+		"target_branch":         mr.TargetBranch,
+		"sha":                   mr.SHA,
+		"merge_commit_sha":      mr.MergeCommitSHA,
+		"squash_commit_sha":     mr.SquashCommitSHA,
+		"author":                map[string]any{"username": "platform-agent", "bot": true},
+		"labels":                mr.Labels,
+		"created_at":            mr.CreatedAt,
+		"updated_at":            mr.UpdatedAt,
+	}
+	if !mr.HideDiffRefs {
+		diffHead := mr.DiffHeadSHA
+		if diffHead == "" {
+			diffHead = mr.SHA
+		}
+		baseSHA := mr.BaseSHA
+		if baseSHA == "" {
+			baseSHA = "1111111111111111111111111111111111111111"
+		}
+		startSHA := mr.StartSHA
+		if startSHA == "" {
+			startSHA = baseSHA
+		}
+		out["diff_refs"] = map[string]any{
+			"base_sha":  baseSHA,
+			"start_sha": startSHA,
+			"head_sha":  diffHead,
+		}
+	}
+	return out
 }
 
 func writeFixtureJSON(w http.ResponseWriter, status int, v any) {

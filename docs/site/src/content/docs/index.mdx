@@ -23,7 +23,7 @@ hero:
 
 import { CardGrid, LinkCard, Card } from '@astrojs/starlight/components';
 
-`core-vcs` gives a Go agent a pure-Go [go-git](https://github.com/go-git/go-git) working copy and a set of neutral verbs — `clone`, `commit`, `publish`, `proposal-create`, `proposal-view`, `proposal-comment`, `proposal-update`, `proposal-close` — that a provider package translates to one forge's API:
+`core-vcs` gives a Go agent a pure-Go [go-git](https://github.com/go-git/go-git) working copy and a set of neutral verbs — `clone`, `commit`, `publish`, `proposal-create`, `proposal-view`, `proposal-comment`, `proposal-update`, `proposal-close`, `proposal-review`, `proposal-merge` — that a provider package translates to one forge's API:
 
 | Provider | Package | Covers |
 |---|---|---|
@@ -56,5 +56,5 @@ import { CardGrid, LinkCard, Card } from '@astrojs/starlight/components';
   <LinkCard title="Workspace & publish guards" href="/core-vcs/concepts/workspace-and-guards/" description="How TARGET_IS_BRANCH, BRANCH_NOT_OURS, BASE_MOVED, and BRANCH_MOVED protect target branches." />
   <LinkCard title="Shared object cache" href="/core-vcs/concepts/shared-cache/" description="Use Policy.CacheDir for linked worktrees across concurrent sessions and processes." />
   <LinkCard title="Credentials & TLS" href="/core-vcs/concepts/credentials/" description="Plug in an outbound credential proxy with CredentialFunc or local tokens." />
-  <LinkCard title="Error codes" href="/core-vcs/reference/error-codes/" description="All 20 structured vcs.Code values, retryability, and recovery guidance." />
+  <LinkCard title="Error codes" href="/core-vcs/reference/error-codes/" description="All 23 structured vcs.Code values, retryability, and recovery guidance." />
 </CardGrid>

@@ -124,4 +124,79 @@ func (r Repo) ProposalCommits(ctx context.Context, number int, p Page) (CommitLi
 func (r Repo) CommentProposal(ctx context.Context, number int, body string) (Comment, error)
 func (r Repo) UpdateProposal(ctx context.Context, number int, u ProposalUpdate) (Proposal, error)
 func (r Repo) CloseProposal(ctx context.Context, number int) (Proposal, error)
+func (r Repo) ReviewProposal(ctx context.Context, number int, req ProposalReviewRequest) (ProposalReview, error)
+func (r Repo) MergeProposal(ctx context.Context, number int, req ProposalMergeRequest) (ProposalMergeResult, error)
+```
+
+### Proposal review & merge types
+
+```go
+type ReviewDecision string
+
+const (
+	ReviewApprove        ReviewDecision = "approve"
+	ReviewRequestChanges ReviewDecision = "request_changes"
+	ReviewComment        ReviewDecision = "comment"
+)
+
+type ReviewLineComment struct {
+	Path string
+	Line int
+	Body string
+}
+
+type ProposalReviewRequest struct {
+	Decision         ReviewDecision      // required: approve | request_changes | comment
+	Body             string              // required for request_changes and comment when Comments is empty
+	ExpectedRevision string              // optional; refuses PROPOSAL_HEAD_MOVED if remote tip moved
+	Comments         []ReviewLineComment // optional inline diff comments
+}
+
+type ProposalReview struct {
+	ID          string
+	Decision    ReviewDecision
+	Author      Actor
+	Body        string
+	Revision    string
+	URL         string
+	SubmittedAt time.Time
+}
+
+type MergeMethod string
+
+const (
+	MergeDefault      MergeMethod = "" // forge default
+	MergeCreateCommit MergeMethod = "merge"
+	MergeSquash       MergeMethod = "squash"
+	MergeRebase       MergeMethod = "rebase"
+)
+
+type ProposalMergeRequest struct {
+	ExpectedRevision   string      // required; compared atomically against the proposal's head SHA
+	Method             MergeMethod // "" uses the repository's default on the forge
+	CommitTitle        string      // optional custom merge/squash commit title
+	CommitMessage      string      // optional custom merge/squash commit body
+	DeleteSourceBranch bool        // best-effort source branch cleanup when supported
+}
+
+type ProposalMergeResult struct {
+	Merged   bool
+	Revision string // resulting target-branch merge/squash commit SHA when reported by the forge
+	Method   MergeMethod
+	Proposal Proposal
+}
+```
+
+### Optional provider extensions (`v1.x` SPI)
+
+`vcs.Provider` stays frozen at `v1.0.0`. Providers that support structured reviews and merges implement these optional interfaces:
+
+```go
+type ProposalReviewer interface {
+	ReviewProposal(ctx context.Context, repo Repo, number int, req ProposalReviewRequest) (ProposalReview, error)
+}
+
+type ProposalMerger interface {
+	MergeProposal(ctx context.Context, repo Repo, number int, req ProposalMergeRequest) (ProposalMergeResult, error)
+}
 ```

@@ -33,7 +33,7 @@ NewCatalog(reg, forges, repos)
 A [`Catalog`](/reference/api-surface/) is built once at startup via `NewCatalog(reg, forges, repos)`:
 
 - **Every configured repository has an explicit `Role`**:
-  - `RoleContext` (`"context"`): read-only reference repository. `Clone`, `Status`, `Diff`, `Log`, and read-only proposal verbs (`ListProposals`, `GetProposal`, `ProposalComments`, `ProposalCommits`) are permitted; any mutating verb (`Commit`, `Publish`, `CreateProposal`, `CommentProposal`, `UpdateProposal`, `CloseProposal`) is refused before network access with `CodeRoleVCSVerbs` (`ROLE_VCS_VERBS`).
+  - `RoleContext` (`"context"`): read-only reference repository. `Clone`, `Status`, `Diff`, `Log`, and read-only proposal verbs (`ListProposals`, `GetProposal`, `ProposalComments`, `ProposalCommits`) are permitted; any mutating verb (`Commit`, `Publish`, `CreateProposal`, `CommentProposal`, `UpdateProposal`, `CloseProposal`, `ReviewProposal`, `MergeProposal`) is refused before network access with `CodeRoleVCSVerbs` (`ROLE_VCS_VERBS`).
   - `RoleGitOps` (`"gitops"`): the primary read-write repository (at most one per `Catalog`) where the agent commits, publishes a topic branch, and opens proposals. Retrieved via `Catalog.GitOps()`.
   - `RoleManaged` (`"managed"`): additional read-write repositories.
 - **Unlisted repositories are refused (`REPO_UNKNOWN`)**: `Catalog.Resolve(value)` only resolves repositories declared in `repos`. If a Go caller deliberately wants to construct an ad-hoc `Repo` for a configured forge, it calls `Catalog.NewRepo(RepoConfig)` explicitly in Go code.

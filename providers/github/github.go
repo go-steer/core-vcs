@@ -24,6 +24,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -77,6 +78,12 @@ type Options struct {
 type Provider struct {
 	opts Options
 }
+
+var (
+	_ vcs.Provider         = (*Provider)(nil)
+	_ vcs.ProposalReviewer = (*Provider)(nil)
+	_ vcs.ProposalMerger   = (*Provider)(nil)
+)
 
 // New constructs a GitHub Provider with default production settings.
 func New() (vcs.Provider, error) {
@@ -516,30 +523,278 @@ func (p *Provider) CloseProposal(ctx context.Context, repo vcs.Repo, number int)
 	return pr.toProposal(), nil
 }
 
+type ghReviewCommentInput struct {
+	Path string `json:"path"`
+	Line int    `json:"line"`
+	Side string `json:"side"`
+	Body string `json:"body"`
+}
+
+// ReviewProposal implements vcs.ProposalReviewer via
+// POST /repos/{owner}/{repo}/pulls/{number}/reviews.
+//
+// When req.ExpectedRevision is set, ReviewProposal checks head.sha before the
+// POST, passes commit_id on the POST (rejecting force-pushes), and re-checks
+// head.sha after the POST so a concurrent non-force push that advanced the tip
+// while expected remained an ancestor commit returns PROPOSAL_HEAD_MOVED
+// (naming the review ID recorded on the stale revision). Because GitHub has no
+// atomic head-SHA compare-and-set on review creation, MergeProposal's sha check
+// remains the atomic commit gate.
+func (p *Provider) ReviewProposal(ctx context.Context, repo vcs.Repo, number int, req vcs.ProposalReviewRequest) (vcs.ProposalReview, error) {
+	var event string
+	switch req.Decision {
+	case vcs.ReviewApprove:
+		event = "APPROVE"
+	case vcs.ReviewRequestChanges:
+		event = "REQUEST_CHANGES"
+	case vcs.ReviewComment:
+		event = "COMMENT"
+	default:
+		return vcs.ProposalReview{}, vcs.Errorf(vcs.CodeForgeRejected, repo.Forge.Name, "unsupported review decision %q", req.Decision).WithVerb(vcs.VerbProposalReview)
+	}
+
+	body := strings.TrimSpace(req.Body)
+	if (req.Decision == vcs.ReviewRequestChanges || req.Decision == vcs.ReviewComment) && body == "" {
+		return vcs.ProposalReview{}, vcs.Errorf(vcs.CodeForgeRejected, repo.Forge.Name, "GitHub %s review requires a non-empty body", req.Decision).WithVerb(vcs.VerbProposalReview)
+	}
+
+	expected := strings.TrimSpace(req.ExpectedRevision)
+	if req.ExpectedRevision != "" && expected == "" {
+		return vcs.ProposalReview{}, vcs.Errorf(vcs.CodeForgeRejected, repo.Forge.Name, "expected revision cannot be whitespace").WithVerb(vcs.VerbProposalReview)
+	}
+
+	prRoute := fmt.Sprintf("/repos/%s/pulls/%d", repo.Ref.Path, number)
+	var headSHA string
+	if expected != "" {
+		var pr ghPull
+		if err := p.doJSON(ctx, repo, vcs.VerbProposalReview, http.MethodGet, prRoute, nil, &pr, notFoundAsUnsupported); err != nil {
+			return vcs.ProposalReview{}, err
+		}
+		if pr.Head.SHA != expected {
+			return vcs.ProposalReview{}, vcs.Errorf(
+				vcs.CodeProposalHeadMoved,
+				repo.Forge.Name,
+				"pull request #%d head branch was modified: expected %s, remote head is %s",
+				number, expected, pr.Head.SHA,
+			).WithVerb(vcs.VerbProposalReview)
+		}
+		headSHA = pr.Head.SHA
+	}
+
+	var comments []ghReviewCommentInput
+	if len(req.Comments) > 0 {
+		comments = make([]ghReviewCommentInput, len(req.Comments))
+		for i, c := range req.Comments {
+			comments[i] = ghReviewCommentInput{
+				Path: c.Path,
+				Line: c.Line,
+				Side: "RIGHT",
+				Body: c.Body,
+			}
+		}
+	}
+
+	in := struct {
+		CommitID string                 `json:"commit_id,omitempty"`
+		Body     string                 `json:"body,omitempty"`
+		Event    string                 `json:"event"`
+		Comments []ghReviewCommentInput `json:"comments,omitempty"`
+	}{
+		CommitID: expected,
+		Body:     body,
+		Event:    event,
+		Comments: comments,
+	}
+
+	var out ghReview
+	route := fmt.Sprintf("/repos/%s/pulls/%d/reviews", repo.Ref.Path, number)
+	if err := p.doJSON(ctx, repo, vcs.VerbProposalReview, http.MethodPost, route, in, &out, reviewOpMode); err != nil {
+		return vcs.ProposalReview{}, err
+	}
+
+	if expected != "" {
+		var postPR ghPull
+		if err := p.doJSON(ctx, repo, vcs.VerbProposalReview, http.MethodGet, prRoute, nil, &postPR, notFoundAsUnsupported); err != nil {
+			return vcs.ProposalReview{}, err
+		}
+		if postPR.Head.SHA != expected {
+			return vcs.ProposalReview{}, vcs.Errorf(
+				vcs.CodeProposalHeadMoved,
+				repo.Forge.Name,
+				"pull request #%d head branch moved during review submission: expected %s, remote head is now %s (review %d was recorded on stale revision %s)",
+				number, expected, postPR.Head.SHA, out.ID, expected,
+			).WithVerb(vcs.VerbProposalReview)
+		}
+	}
+
+	fallbackRev := expected
+	if fallbackRev == "" {
+		fallbackRev = headSHA
+	}
+	return out.toProposalReview(req.Decision, fallbackRev), nil
+}
+
+// MergeProposal implements vcs.ProposalMerger via
+// PUT /repos/{owner}/{repo}/pulls/{number}/merge, followed by best-effort
+// DELETE /repos/{owner}/{repo}/git/refs/heads/{source} when
+// req.DeleteSourceBranch is true and the source branch is an unprotected,
+// non-base branch in the same repository.
+func (p *Provider) MergeProposal(ctx context.Context, repo vcs.Repo, number int, req vcs.ProposalMergeRequest) (vcs.ProposalMergeResult, error) {
+	expected := strings.TrimSpace(req.ExpectedRevision)
+	if expected == "" {
+		return vcs.ProposalMergeResult{}, vcs.Errorf(vcs.CodeForgeRejected, repo.Forge.Name, "expected revision is required to merge a proposal").WithVerb(vcs.VerbProposalMerge)
+	}
+	switch req.Method {
+	case vcs.MergeDefault, vcs.MergeCreateCommit, vcs.MergeSquash, vcs.MergeRebase:
+	default:
+		return vcs.ProposalMergeResult{}, vcs.Errorf(vcs.CodeForgeRejected, repo.Forge.Name, "unsupported merge method %q", req.Method).WithVerb(vcs.VerbProposalMerge)
+	}
+
+	in := struct {
+		SHA           string `json:"sha"`
+		MergeMethod   string `json:"merge_method,omitempty"`
+		CommitTitle   string `json:"commit_title,omitempty"`
+		CommitMessage string `json:"commit_message,omitempty"`
+	}{
+		SHA:           expected,
+		MergeMethod:   string(req.Method),
+		CommitTitle:   req.CommitTitle,
+		CommitMessage: req.CommitMessage,
+	}
+
+	var mergeOut struct {
+		SHA     string `json:"sha"`
+		Merged  bool   `json:"merged"`
+		Message string `json:"message"`
+	}
+	prRoute := fmt.Sprintf("/repos/%s/pulls/%d", repo.Ref.Path, number)
+	route := fmt.Sprintf("/repos/%s/pulls/%d/merge", repo.Ref.Path, number)
+	if status, err := p.doJSONWithStatus(ctx, repo, vcs.VerbProposalMerge, http.MethodPut, route, in, &mergeOut, mergeOpMode); err != nil {
+		if (status == http.StatusMethodNotAllowed || status == http.StatusUnprocessableEntity) && vcs.IsCode(err, vcs.CodeForgeRejected) {
+			detail := errDetail(err)
+			if !isGitHubExplicitMergeRefusal(detail) {
+				var curPR ghPull
+				if getErr := p.doJSON(ctx, repo, vcs.VerbProposalMerge, http.MethodGet, prRoute, nil, &curPR, notFoundAsUnsupported); getErr == nil {
+					if strings.EqualFold(strings.TrimSpace(curPR.MergeableState), "blocked") {
+						return vcs.ProposalMergeResult{}, vcs.Errorf(vcs.CodeProtectedBranch, repo.Forge.Name, "%s (mergeable_state=blocked)", detail).WithVerb(vcs.VerbProposalMerge)
+					}
+				}
+			}
+		}
+		return vcs.ProposalMergeResult{}, err
+	}
+	if !mergeOut.Merged {
+		msg := strings.TrimSpace(mergeOut.Message)
+		if msg == "" {
+			msg = "pull request was not merged"
+		}
+		return vcs.ProposalMergeResult{}, vcs.Errorf(vcs.CodeForgeRejected, repo.Forge.Name, "%s", msg).WithVerb(vcs.VerbProposalMerge)
+	}
+
+	var pr ghPull
+	var prop vcs.Proposal
+	sameRepo := false
+	if err := p.doJSON(ctx, repo, vcs.VerbProposalMerge, http.MethodGet, prRoute, nil, &pr, notFoundAsUnsupported); err != nil {
+		prop = vcs.Proposal{
+			Number: number,
+			State:  vcs.ProposalMerged,
+		}
+	} else {
+		prop = pr.toProposal()
+		prop.State = vcs.ProposalMerged
+		// GitHub sets head.repo to null when a fork repository was deleted;
+		// only treat non-nil head.repo matching repo.Ref.Path as same-repo.
+		sameRepo = pr.Head.Repo != nil && strings.EqualFold(strings.TrimSpace(pr.Head.Repo.FullName), repo.Ref.Path)
+	}
+
+	if req.DeleteSourceBranch && sameRepo && prop.Source != "" && prop.Source != prop.Target {
+		if p.canDeleteSourceBranch(ctx, repo, pr, prop.Source) {
+			delRoute := "/repos/" + repo.Ref.Path + "/git/refs/heads/" + escapeRefPath(prop.Source)
+			_ = p.doJSON(ctx, repo, vcs.VerbProposalMerge, http.MethodDelete, delRoute, nil, nil, notFoundAsUnsupported)
+		}
+	}
+
+	return vcs.ProposalMergeResult{
+		Merged:   true,
+		Revision: mergeOut.SHA,
+		Method:   req.Method,
+		Proposal: prop,
+	}, nil
+}
+
+func (p *Provider) canDeleteSourceBranch(ctx context.Context, repo vcs.Repo, pr ghPull, source string) bool {
+	if repo.BaseBranch != "" && source == repo.BaseBranch {
+		return false
+	}
+	defaultBranch := ""
+	if pr.Base.Repo != nil {
+		defaultBranch = strings.TrimSpace(pr.Base.Repo.DefaultBranch)
+	}
+	if defaultBranch == "" {
+		b, err := p.BaseBranch(ctx, repo)
+		if err != nil {
+			return false
+		}
+		defaultBranch = b
+	}
+	if source == defaultBranch {
+		return false
+	}
+	prot, err := p.ProtectedBranch(ctx, repo, source)
+	if err != nil || prot {
+		return false
+	}
+	return true
+}
+
+func errDetail(err error) string {
+	var ve *vcs.Error
+	if errors.As(err, &ve) && ve.Detail != "" {
+		return ve.Detail
+	}
+	return err.Error()
+}
+
+func escapeRefPath(ref string) string {
+	ref = strings.TrimPrefix(strings.TrimSpace(ref), "refs/heads/")
+	segs := strings.Split(ref, "/")
+	for i, seg := range segs {
+		segs[i] = url.PathEscape(seg)
+	}
+	return strings.Join(segs, "/")
+}
+
 type notFoundMode int
 
 const (
 	notFoundAsUnsupported notFoundMode = iota
 	notFoundAsBaseBranchMissing
 	notFoundOnBranchCheck
+	reviewOpMode
+	mergeOpMode
 )
 
 func (p *Provider) doJSON(ctx context.Context, repo vcs.Repo, verb vcs.Verb, method, route string, in, out any, nfMode notFoundMode) error {
+	_, err := p.doJSONWithStatus(ctx, repo, verb, method, route, in, out, nfMode)
+	return err
+}
+
+func (p *Provider) doJSONWithStatus(ctx context.Context, repo vcs.Repo, verb vcs.Verb, method, route string, in, out any, nfMode notFoundMode) (int, error) {
 	client, err := vcs.NewHTTPClient(repo.Forge)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	var body io.Reader
 	if in != nil {
 		b, err := json.Marshal(in)
 		if err != nil {
-			return vcs.Errorf(vcs.CodeForgeCallFailed, repo.Forge.Name, "marshal request: %w", err).WithVerb(verb)
+			return 0, vcs.Errorf(vcs.CodeForgeCallFailed, repo.Forge.Name, "marshal request: %w", err).WithVerb(verb)
 		}
 		body = bytes.NewReader(b)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, p.APIBaseURL(repo.Forge)+route, body)
 	if err != nil {
-		return vcs.Errorf(vcs.CodeForgeCallFailed, repo.Forge.Name, "%w", err).WithVerb(verb)
+		return 0, vcs.Errorf(vcs.CodeForgeCallFailed, repo.Forge.Name, "%w", err).WithVerb(verb)
 	}
 	req.Header.Set("Accept", AcceptHeader)
 	req.Header.Set("X-GitHub-Api-Version", APIVersion)
@@ -553,28 +808,28 @@ func (p *Provider) doJSON(ctx context.Context, repo vcs.Repo, verb vcs.Verb, met
 			if code == "" {
 				code = vcs.CodeConfigInvalid
 			}
-			return vcs.Errorf(code, repo.Forge.Name, "%w", err).WithVerb(verb)
+			return 0, vcs.Errorf(code, repo.Forge.Name, "%w", err).WithVerb(verb)
 		}
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return vcs.TransportError(repo.Forge, verb, err)
+		return 0, vcs.TransportError(repo.Forge, verb, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
-		return vcs.TransportError(repo.Forge, verb, err)
+		return resp.StatusCode, vcs.TransportError(repo.Forge, verb, err)
 	}
 	if resp.StatusCode >= 300 {
-		return classifyError(repo.Forge.Name, verb, resp, raw, nfMode)
+		return resp.StatusCode, classifyError(repo.Forge.Name, verb, resp, raw, nfMode)
 	}
 	if out != nil && len(raw) > 0 {
 		if err := json.Unmarshal(raw, out); err != nil {
-			return vcs.Errorf(vcs.CodeForgeCallFailed, repo.Forge.Name, "decode response: %w", err).WithVerb(verb)
+			return resp.StatusCode, vcs.Errorf(vcs.CodeForgeCallFailed, repo.Forge.Name, "decode response: %w", err).WithVerb(verb)
 		}
 	}
-	return nil
+	return resp.StatusCode, nil
 }
 
 type ghErrorPayload struct {
@@ -648,10 +903,46 @@ func classifyError(forge string, verb vcs.Verb, resp *http.Response, body []byte
 			return vcs.Errorf(vcs.CodeForgeUnsupported, forge, "%s", detail).WithVerb(verb)
 		}
 
+	case http.StatusMethodNotAllowed:
+		if nfMode == mergeOpMode {
+			if isGitHubTransientBaseModified(detail) {
+				return vcs.Errorf(vcs.CodeForgeUnavailable, forge, "%s; retry the call", detail).WithVerb(verb)
+			}
+			if isGitHubProtectionBlocked(detail) {
+				return vcs.Errorf(vcs.CodeProtectedBranch, forge, "%s", detail).WithVerb(verb)
+			}
+			return vcs.Errorf(vcs.CodeForgeRejected, forge, "%s", detail).WithVerb(verb)
+		}
+		return vcs.Errorf(vcs.CodeForgeCallFailed, forge, "HTTP %d: %s", resp.StatusCode, detail).WithVerb(verb)
+
+	case http.StatusConflict:
+		if nfMode == reviewOpMode || nfMode == mergeOpMode {
+			if isGitHubHeadMismatch(payload, detail) {
+				return vcs.Errorf(vcs.CodeProposalHeadMoved, forge, "%s", detail).WithVerb(verb)
+			}
+			return vcs.Errorf(vcs.CodeForgeRejected, forge, "%s", detail).WithVerb(verb)
+		}
+		return vcs.Errorf(vcs.CodeForgeRejected, forge, "%s; fix the request fields", detail).WithVerb(verb)
+
 	case http.StatusUnprocessableEntity:
+		if nfMode == reviewOpMode {
+			if isGitHubHeadMismatch(payload, detail) {
+				return vcs.Errorf(vcs.CodeProposalHeadMoved, forge, "%s", detail).WithVerb(verb)
+			}
+			return vcs.Errorf(vcs.CodeForgeRejected, forge, "%s", detail).WithVerb(verb)
+		}
+		if nfMode == mergeOpMode {
+			if isGitHubHeadMismatch(payload, detail) {
+				return vcs.Errorf(vcs.CodeProposalHeadMoved, forge, "%s", detail).WithVerb(verb)
+			}
+			if isGitHubProtectionBlocked(detail) {
+				return vcs.Errorf(vcs.CodeProtectedBranch, forge, "%s", detail).WithVerb(verb)
+			}
+			return vcs.Errorf(vcs.CodeForgeRejected, forge, "%s", detail).WithVerb(verb)
+		}
 		return vcs.Errorf(vcs.CodeForgeCallFailed, forge, "%s", detail).WithVerb(verb)
 
-	case http.StatusBadRequest, http.StatusConflict:
+	case http.StatusBadRequest:
 		return vcs.Errorf(vcs.CodeForgeRejected, forge, "%s; fix the request fields", detail).WithVerb(verb)
 
 	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
@@ -663,6 +954,74 @@ func classifyError(forge string, verb vcs.Verb, resp *http.Response, body []byte
 	default:
 		return vcs.Errorf(vcs.CodeForgeCallFailed, forge, "HTTP %d: %s", resp.StatusCode, detail).WithVerb(verb)
 	}
+}
+
+func isGitHubTransientBaseModified(detail string) bool {
+	return strings.Contains(strings.ToLower(detail), "base branch was modified")
+}
+
+func isGitHubHeadMismatch(payload ghErrorPayload, detail string) bool {
+	for _, item := range payload.Errors {
+		f := strings.ToLower(strings.TrimSpace(item.Field))
+		if f == "commit_id" || f == "sha" {
+			return true
+		}
+	}
+	lower := strings.ToLower(detail)
+	if strings.Contains(lower, "merge conflict") ||
+		strings.Contains(lower, "not mergeable") ||
+		strings.Contains(lower, "base branch was modified") {
+		return false
+	}
+	return strings.Contains(lower, "head branch was modified") ||
+		strings.Contains(lower, "head was modified") ||
+		strings.Contains(lower, "sha does not match") ||
+		strings.Contains(lower, "expected sha")
+}
+
+func isGitHubExplicitMergeRefusal(detail string) bool {
+	lower := strings.ToLower(detail)
+	return strings.Contains(lower, "still a draft") ||
+		strings.Contains(lower, "is a draft") ||
+		strings.Contains(lower, "merge conflict") ||
+		strings.Contains(lower, "merges are not allowed") ||
+		strings.Contains(lower, "merge commits are not allowed") ||
+		strings.Contains(lower, "squash merges are not allowed") ||
+		strings.Contains(lower, "rebase merges are not allowed") ||
+		strings.Contains(lower, "already merged") ||
+		strings.Contains(lower, "is closed")
+}
+
+func isGitHubProtectionBlocked(detail string) bool {
+	if isGitHubExplicitMergeRefusal(detail) {
+		return false
+	}
+	lower := strings.ToLower(detail)
+	for _, marker := range []string{
+		"protected branch",
+		"branch protection",
+		"approving review",
+		"review is required",
+		"reviews are required",
+		"code owner",
+		"changes requested",
+		"requested changes",
+		"required status check",
+		"status checks",
+		"checks are required",
+		"waiting for status",
+		"repository rule",
+		"rule violation",
+		"ruleset",
+		"signed commit",
+		"linear history",
+		"merge queue",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func rateLimitResetHint(resp *http.Response, msg string) string {
@@ -701,24 +1060,32 @@ type ghLabel struct {
 }
 
 type ghPull struct {
-	Number    int       `json:"number"`
-	HTMLURL   string    `json:"html_url"`
-	Title     string    `json:"title"`
-	Body      string    `json:"body"`
-	State     string    `json:"state"`
-	Draft     bool      `json:"draft"`
-	Merged    bool      `json:"merged"`
-	MergedAt  *string   `json:"merged_at"`
-	User      ghUser    `json:"user"`
-	Labels    []ghLabel `json:"labels"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Head      struct {
-		Ref string `json:"ref"`
-		SHA string `json:"sha"`
+	Number         int       `json:"number"`
+	HTMLURL        string    `json:"html_url"`
+	Title          string    `json:"title"`
+	Body           string    `json:"body"`
+	State          string    `json:"state"`
+	Draft          bool      `json:"draft"`
+	Merged         bool      `json:"merged"`
+	MergedAt       *string   `json:"merged_at"`
+	MergeableState string    `json:"mergeable_state"`
+	User           ghUser    `json:"user"`
+	Labels         []ghLabel `json:"labels"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+	Head           struct {
+		Ref  string `json:"ref"`
+		SHA  string `json:"sha"`
+		Repo *struct {
+			FullName string `json:"full_name"`
+		} `json:"repo"`
 	} `json:"head"`
 	Base struct {
-		Ref string `json:"ref"`
+		Ref  string `json:"ref"`
+		Repo *struct {
+			FullName      string `json:"full_name"`
+			DefaultBranch string `json:"default_branch"`
+		} `json:"repo"`
 	} `json:"base"`
 }
 
@@ -774,7 +1141,9 @@ func (c ghIssueComment) toComment() vcs.Comment {
 
 type ghReview struct {
 	ID          int64     `json:"id"`
+	State       string    `json:"state"`
 	Body        string    `json:"body"`
+	CommitID    string    `json:"commit_id"`
 	HTMLURL     string    `json:"html_url"`
 	User        ghUser    `json:"user"`
 	SubmittedAt time.Time `json:"submitted_at"`
@@ -788,6 +1157,31 @@ func (r ghReview) toComment() vcs.Comment {
 		Body:      r.Body,
 		URL:       r.HTMLURL,
 		CreatedAt: r.SubmittedAt,
+	}
+}
+
+func (r ghReview) toProposalReview(fallbackDecision vcs.ReviewDecision, fallbackRevision string) vcs.ProposalReview {
+	dec := fallbackDecision
+	switch strings.ToUpper(strings.TrimSpace(r.State)) {
+	case "APPROVED":
+		dec = vcs.ReviewApprove
+	case "CHANGES_REQUESTED":
+		dec = vcs.ReviewRequestChanges
+	case "COMMENTED":
+		dec = vcs.ReviewComment
+	}
+	rev := strings.TrimSpace(r.CommitID)
+	if rev == "" {
+		rev = fallbackRevision
+	}
+	return vcs.ProposalReview{
+		ID:          strconv.FormatInt(r.ID, 10),
+		Decision:    dec,
+		Author:      r.User.toActor(),
+		Body:        r.Body,
+		Revision:    rev,
+		URL:         r.HTMLURL,
+		SubmittedAt: r.SubmittedAt,
 	}
 }
 
