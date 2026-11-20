@@ -1,6 +1,6 @@
 ---
 title: Credentials & TLS
-description: Supply tokens via CredentialFunc (outbound proxy), environment variables, files, or static values, and configure custom CAs.
+description: Supply tokens via CredentialFunc (outbound proxy), mounted secret files (TokenFile), or StaticToken, and configure custom CAs.
 sidebar:
   order: 4
 ---
@@ -31,15 +31,18 @@ forge := vcs.Forge{
 
 Because `Token(ctx)` is called on each network operation (`Clone`, `Publish`, `CreateProposal`, …), short-lived tokens are refreshed automatically and per-caller `context.Context` values flow through to your resolver.
 
-### `TokenFromFile` & `TokenFromEnv` (local & Kubernetes Secret mounts)
+### `TokenFile` & `StaticToken` (Kubernetes Secret mounts & local tokens)
 
-- `vcs.TokenFromFile(path)` reads and trims `path` on each call, so rotated Kubernetes Secret volume projections are picked up without restarting the process.
-- `vcs.TokenFromEnv(name)` reads `$name` on each call.
-- `vcs.StaticToken(token)` holds a fixed token in memory (useful in tests).
+- `vcs.TokenFile(path)` reads and trims `path` on each call, so rotated Kubernetes Secret volume projections are picked up without restarting the process.
+- `vcs.StaticToken(token)` holds a fixed token in memory (for tests, or when a CLI consumer reads an environment variable at startup via `vcs.StaticToken(os.Getenv("GITHUB_TOKEN"))`).
 
 ## Secret redaction
 
-All built-in `Credential` implementations and `*vcs.BasicAuth` implement `fmt.Stringer` and `fmt.GoStringer` returning `"[REDACTED]"`. Printing a `Forge`, `Repo`, or `BasicAuth` with `%v`, `%+v`, `%#v`, or `%s` never leaks a token into logs.
+Every built-in `Credential` implementation and `vcs.BasicAuth` overrides `String`, `GoString`, and `Format` so tokens never leak when a `Forge`, `Repo`, or `BasicAuth` is formatted with `%v`, `%+v`, `%#v`, or `%s`:
+
+- `CredentialFunc` and `StaticToken` print `"[redacted]"`.
+- `TokenFile(path)` prints `"TokenFile(<path>)"` (the path, never the file's contents).
+- `BasicAuth` prints `"BasicAuth(<username>)"` (the username, withholding `Password`).
 
 ## Self-hosted TLS (`Forge.CAFile`)
 
@@ -51,7 +54,7 @@ forge := vcs.Forge{
 	Provider: "gitlab",
 	Host:     "gitlab.internal.example",
 	CAFile:   "/etc/ssl/certs/corp-root-ca.pem",
-	Cred:     vcs.TokenFromFile("/var/run/secrets/gitlab/token"),
+	Cred:     vcs.TokenFile("/var/run/secrets/gitlab/token"),
 }
 ```
 

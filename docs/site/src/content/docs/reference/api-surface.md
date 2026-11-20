@@ -62,7 +62,9 @@ func (c *Catalog) Resolve(value string) (Repo, error)
 func (c *Catalog) GitOps() (Repo, bool)
 func (c *Catalog) NewRepo(cfg RepoConfig) (Repo, error)
 func (c *Catalog) Repos() []Repo
+func (c *Catalog) Forge(name string) (Forge, bool)
 func (c *Catalog) Forges() []Forge
+func (c *Catalog) Hosts() []string
 ```
 
 ### Credentials (`vcs.Credential`)
@@ -75,8 +77,7 @@ type Credential interface {
 type CredentialFunc func(ctx context.Context) (string, error)
 
 func StaticToken(token string) Credential
-func TokenFromEnv(name string) Credential
-func TokenFromFile(path string) Credential
+func TokenFile(path string) Credential
 ```
 
 ### `Workspace` & `Policy`

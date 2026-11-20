@@ -2,6 +2,8 @@ module github.com/go-steer/core-vcs
 
 go 1.26.10
 
+toolchain go1.26.11
+
 require (
 	github.com/go-git/go-billy/v5 v5.9.2
 	github.com/go-git/go-git/v5 v5.19.3

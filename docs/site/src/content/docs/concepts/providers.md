@@ -9,7 +9,7 @@ sidebar:
 
 | Provider name | Package | Hosts & API | Proposal noun |
 |---|---|---|---|
-| `"github"` | `providers/github` | `github.com` (`https://api.github.com`) and GitHub Enterprise Server (`https://<host>/api/v3`, or custom `Forge.APIBaseURL`) | `"pull request"` |
+| `"github"` | `providers/github` | `github.com` (`https://api.github.com`) and GitHub Enterprise Server (`https://<host>/api/v3` via `Forge.Host`) | `"pull request"` |
 | `"gitlab"` | `providers/gitlab` | `gitlab.com` (`https://gitlab.com/api/v4`) and self-managed GitLab (`https://<host>/api/v4`, arbitrary-depth `group/sub/project` paths) | `"merge request"` |
 | `"git"` | `providers/git` | Any smart-HTTP Git server (`https://<host>/<path>.git`) | `"link"` (when `Forge.ProposalURLTemplate` is set) or `"missing"` |
 
@@ -27,7 +27,7 @@ sidebar:
 - **Nested groups**: Supports arbitrary namespace depth (`group/sub/project`), URL-encoding the full path as a single segment (`/api/v4/projects/group%2Fsub%2Fproject/...`).
 - **Draft proposals**: Uses GitLab's `"Draft: "` title prefix convention on create and update, stripping the prefix on read so `Proposal.Title` and `Proposal.Draft` behave identically to GitHub.
 - **Reviews & merges**: Implements `ProposalReviewer` (verifying `sha` and `diff_refs.head_sha`, posting inline comments via `/discussions`, summary notes via `/notes`, recording approvals via `/approve` with `GET /approvals` disambiguation on `401` for idempotent retries vs `user_can_approve=false` `FORGE_REJECTED`, and revoking prior approvals via `/unapprove` on `request_changes`) and `ProposalMerger` (`PUT /projects/{id}/merge_requests/{iid}/merge` with atomic `sha: ExpectedRevision`, refusing `MergeRebase` with `FORGE_UNSUPPORTED`, mapping `409` SHA drift to `PROPOSAL_HEAD_MOVED`, and inspecting `detailed_merge_status` via `GET /projects/{id}/merge_requests/{iid}` on generic `405`/`406`/`422` responses to classify policy/approval/CI/discussion blocks as `PROTECTED_BRANCH` vs draft/conflict/rebase refusals as `FORGE_REJECTED`).
-- **Protected branches**: Treats `push_access_levels` where every level is `0` (`No one`) or `> 30` (Maintainer-only) as protected unless `allow_force_push` is enabled.
+- **Protected branches**: Queries `GET /projects/{id}/protected_branches` and treats `branch` as protected when any rule `name` matches it by exact name or GitLab `*` wildcard.
 
 ### Bare Git remote (`providers/git`)
 
