@@ -36,7 +36,7 @@ func run(ctx context.Context) error {
 			{
 				Name:     "github",
 				Provider: "github",
-				Cred:     vcs.TokenFromEnv("GITHUB_TOKEN"),
+				Cred:     vcs.StaticToken(os.Getenv("GITHUB_TOKEN")),
 				CommitIdentity: vcs.Identity{
 					Name:  "gitops-agent",
 					Email: "gitops-agent@acme.example",

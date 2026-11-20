@@ -20,10 +20,10 @@ if vcs.CodeOf(err).Retryable() {
 
 | Code | Constant | Retryable | Meaning & recovery action |
 |---|---|---|---|
-| `CONFIG_INVALID` | `CodeConfigInvalid` | No | `Forge`, `CatalogConfig`, or `Policy` failed validation, or commit author identity is missing. Fix configuration. |
+| `CONFIG_INVALID` | `CodeConfigInvalid` | No | `Forge`, `RepoConfig`, or `Policy` failed validation, or commit author identity is missing. Fix configuration. |
 | `REPO_INVALID` | `CodeRepoInvalid` | No | `ParseRepoRef` or provider `Resolve` rejected the repository path (traversal, leading `-`, credentials in URL, wrong segment depth). |
-| `REPO_UNKNOWN` | `CodeRepoUnknown` | No | Repository is not listed in `CatalogConfig.Repos` (or `Catalog.Repo("")` is ambiguous). Add the repository to the catalog. |
-| `FORGE_UNSUPPORTED` | `CodeForgeUnsupported` | No | No configured forge serves this host, provider name, or verb (for example, `proposal-list` on a bare `git` remote). |
+| `REPO_UNKNOWN` | `CodeRepoUnknown` | No | Repository on a matched forge is not listed in the `Catalog` allowlist. Add a `RepoConfig` entry to `NewCatalog` (or call `Catalog.NewRepo` explicitly in Go). |
+| `FORGE_UNSUPPORTED` | `CodeForgeUnsupported` | No | No configured forge serves this host, provider name, or verb (for example, `proposal-list` on a bare `git` remote, HTTP 404 on a forge endpoint, or a host-less `Catalog.Resolve` value that is ambiguous across multiple forges). |
 | `ROLE_VCS_VERBS` | `CodeRoleVCSVerbs` | No | A mutating verb (`commit`, `publish`, `proposal-create`, …) was called on a `RoleContext` repository. |
 
 ## Workspace & publish guard codes
@@ -48,7 +48,7 @@ if vcs.CodeOf(err).Retryable() {
 | `PROPOSAL_HEAD_MOVED` | `CodeProposalHeadMoved` | No | Remote proposal head no longer matches `ExpectedRevision` on `ReviewProposal` or `MergeProposal`. Re-read the proposal and diff before reviewing or merging. |
 | `FORGE_UNAUTHORIZED` | `CodeForgeUnauthorized` | No | HTTP 401, unthrottled HTTP 403, or empty/failed credential resolution. Stop and report the credential failure. |
 | `FORGE_UNAVAILABLE` | `CodeForgeUnavailable` | **Yes** | HTTP 5xx, HTTP 429, rate-limited HTTP 403 (`Retry-After` / `X-RateLimit-Remaining: 0`), or network timeout/connection reset. Retry with backoff. |
-| `FORGE_REJECTED` | `CodeForgeRejected` | No | HTTP 400 / 404 / 409 / 422 or non-fast-forward push rejection. Fix the request parameters or commit message. |
+| `FORGE_REJECTED` | `CodeForgeRejected` | No | HTTP 400 / 405 / 409 / 422 or non-fast-forward push rejection. Fix the request parameters or commit message. |
 | `FORGE_CALL_FAILED` | `CodeForgeCallFailed` | No | Unexpected forge response or decode error; `Error.Detail` carries the forge's message verbatim. |
 | `FORGE_TLS_UNTRUSTED` | `CodeForgeTLSUntrusted` | No | Server TLS certificate failed verification; set `Forge.CAFile` to the trusted PEM bundle. |
 | `FORGE_IDENTITY_UNKNOWN` | `CodeForgeIdentityUnknown` | No | Credential cannot identify its forge login. |
